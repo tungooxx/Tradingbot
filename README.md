@@ -1,2 +1,3 @@
 # Tradingbot
-Trading?
+![Alt text](img/sample.png)
+
