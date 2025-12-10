@@ -12,9 +12,7 @@ import math
 import matplotlib.pyplot as plt
 import pandas_ta as ta
 import random
-# ==============================================================================
-# 1. YOUR KAN LINEAR IMPLEMENTATION
-# ==============================================================================
+from collections import deque
 def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -23,6 +21,7 @@ def set_seed(seed=42):
     # This ensures exact reproducibility
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 set_seed(42) # Call this!
 class KANLinear(nn.Module):
@@ -284,7 +283,7 @@ class TradingLogger:
         return final
 
 class StockTradingEnv(gym.Env):
-    def __init__(self, ticker="^IXIC", window_size=30):
+    def __init__(self, ticker="NVDA", window_size=10):
         super(StockTradingEnv, self).__init__()
         print(f"📥 Downloading {ticker} data...")
         self.df = yf.download(ticker, period="5y", interval="1d", progress=False)
@@ -374,8 +373,7 @@ class StockTradingEnv(gym.Env):
                 self.shares = self.balance / current_price
                 self.balance = 0.0
                 self.entry_price = current_price
-                # Small incentive to enter trades vs just sitting
-                reward += 0.1
+                reward -= 0.05  # Tiny penalty for entry
 
         elif action == 2:  # SELL
             if self.shares > 0:
@@ -383,15 +381,12 @@ class StockTradingEnv(gym.Env):
                 net_val = gross_val * 0.999
                 cost_basis = self.shares * self.entry_price
                 profit_dollars = net_val - cost_basis
-
-                # Reward is Profit % * 100
                 reward = (profit_dollars / cost_basis) * 100
-
                 self.balance = net_val
                 self.shares = 0
                 self.entry_price = 0
 
-        # --- 2. HOLDING VS. BOREDOM LOGIC ---
+        # --- 2. HOLDING LOGIC (Safety Checks + Compass) ---
         if self.shares > 0:
             current_return = (current_price - self.entry_price) / self.entry_price
 
@@ -411,16 +406,12 @@ class StockTradingEnv(gym.Env):
                 self.entry_price = 0.0
                 reward = +20.0  # Big Reward
 
-            # C. THE COMPASS (Holding Bonus)
+            # C. THE COMPASS (Daily Feedback)
+            # If we didn't hit SL or TP, tell the agent how today went.
             else:
-                # If we are holding, give a small cookie (+0.01) so it learns patience
+                # Give it the daily return as a cookie + small holding bonus
+                # This fixes the "Sparse Reward" problem
                 reward += (daily_log_ret * 10) + 0.01
-
-        # --- D. THE BOREDOM PENALTY (NEW) ---
-        else:
-            # If shares == 0 (Sitting in Cash), applying a small penalty.
-            # This forces the agent to look for entries rather than playing dead.
-            reward -= 0.02
 
         self.current_step += 1
         if self.current_step >= self.max_steps:
@@ -428,11 +419,83 @@ class StockTradingEnv(gym.Env):
 
         return self._get_observation(), reward, done, False, {}
 
+# Inherit from your original environment
+class GuardianStockEnv(StockTradingEnv):
+    def step(self, action):
+        current_price = self.data[self.current_step][0]
+        daily_log_ret = self.data[self.current_step][1]
 
-# ==============================================================================
-# 4. TRAINING LOGIC
-# ==============================================================================
+        reward = 0
+        done = False
 
+        # --- 1. ACTION LOGIC ---
+        if action == 1:  # BUY
+            if self.shares == 0 and self.balance > 0:
+                self.shares = self.balance / current_price
+                self.balance = 0.0
+                self.entry_price = current_price
+                # CHANGE 1: Remove entry penalty. Let it enter freely.
+                reward = 0.0
+
+        elif action == 2:  # SELL
+            if self.shares > 0:
+                gross_val = self.shares * current_price
+                net_val = gross_val * 0.999
+                cost_basis = self.shares * self.entry_price
+                profit_dollars = net_val - cost_basis
+
+                # Reward is % Return. e.g. +5% = +5.0 reward
+                reward = (profit_dollars / cost_basis) * 100
+
+                self.balance = net_val
+                self.shares = 0
+                self.entry_price = 0
+
+        # --- 2. HOLDING LOGIC ---
+        if self.shares > 0:
+            current_return = (current_price - self.entry_price) / self.entry_price
+
+            # A. STOP LOSS (-8% for Crypto / -5% for Stocks)
+            if current_return < -0.05:
+                gross_val = self.shares * current_price
+                self.balance = gross_val * 0.999
+                self.shares = 0.0
+                self.entry_price = 0.0
+
+                # CHANGE 2: Soften the blow.
+                # Instead of -5.0 flat, just give the actual % loss (e.g. -5.0)
+                # The agent already hates losing money, no need to add extra.
+                reward = current_return * 100
+
+                # B. TAKE PROFIT (+20%)
+            elif current_return > 0.20:
+                gross_val = self.shares * current_price
+                self.balance = gross_val * 0.999
+                self.shares = 0.0
+                self.entry_price = 0.0
+
+                # Big Reward! (+20.0)
+                reward = current_return * 100
+
+            # C. THE COMPASS (Daily Feedback)
+            else:
+                # CHANGE 3: Increase Holding Bonus
+                # Give it a stronger "Cookie" for enduring volatility
+                # daily_log_ret can be negative, so we add a larger base (+0.1)
+                # to keep it positive unless the drop is huge.
+                reward += (daily_log_ret * 10) + 0.05
+
+        # CHANGE 4: REWARD CLIPPING (Crucial for PPO Stability)
+        # PPO breaks if rewards are too big (-20 or +20).
+        # We clip it to range [-1, 1] roughly, or scale it down.
+        # Simple scaling: Divide by 10
+        reward = reward / 10.0
+
+        self.current_step += 1
+        if self.current_step >= self.max_steps:
+            done = True
+
+        return self._get_observation(), reward, done, False, {}
 def prepare_pretraining_data(env):
     """Extracts windows (X) and next day Log Returns (y) from environment data"""
     X_list = []
@@ -444,166 +507,172 @@ def prepare_pretraining_data(env):
 
     for i in range(env.window_size, len(env.data) - 1):
         window = env.data[i - env.window_size : i] # The past
-        target = env.data[i][1] * 100 # The Log_Ret of "today" (which is next step relative to window)
+        target = env.data[i][1] # The Log_Ret of "today" (which is next step relative to window)
 
         X_list.append(window.flatten())
         y_list.append(target)
 
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32).reshape(-1, 1)
+def train_guardian():
 
-def run_pipeline():
-    # 1. Init Env
-    env = StockTradingEnv(ticker='^IXIC', window_size=30)
+
+    print("🛡️ TRAINING THE GUARDIAN AGENT...")
+    print("   Objective: Survive. Avoid Losses. Dodging Crashes.")
+    logger = TradingLogger()
+    # 1. Use the NEW Guardian Environment
+    # We use window_size=30 to match your standard architecture
+    env = GuardianStockEnv(ticker="NVDA", window_size=30)
+
+    # 2. Setup Agent & Optimizer
     obs_dim = env.obs_shape
     action_dim = env.action_space.n
-    hidden_dim = 32 # Keep small for speed
+    agent = KANActorCritic(obs_dim, action_dim, hidden_dim=32)
 
+    # Low LR because Guardians should be conservative learners
+    optimizer = torch.optim.Adam(agent.parameters(), lr=0.0001)
+
+    # 3. PPO Hyperparameters
+    GAMMA = 0.99
+    EPS_CLIP = 0.2
+    K_EPOCHS = 3
+    UPDATE_FREQ = 1000  # Update brain every 1000 steps
+    hidden_dim = 32
+    # 4. Memory Buffers
+    memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
+    recent_rewards = deque(maxlen=100) # For tracking progress
+
+    # 5. Training Loop
+    state, _ = env.reset()
     # ==========================================
-    # PHASE 1: PRE-TRAINING (SUPERVISED)
+    # PHASE 1: SUPERVISED PRE-TRAINING
     # ==========================================
-    print("\n🧠 PHASE 1: Pre-training KAN Predictor...")
+    # --- PHASE 1: PRE-TRAIN (THE MICROSCOPE FIX) ---
+    print("\n🧠 PHASE 1: Pre-training (Target * 100)...")
+    X_list, y_list = [], []
+    for i in range(env.window_size, len(env.data) - 1):
+        X_list.append(env.data[i - env.window_size : i].flatten())
+        y_list.append(env.data[i][1] * 100) # SCALED TARGET
 
-    # Create dataset
-    X_train, y_train = prepare_pretraining_data(env)
-    dataset = torch.utils.data.TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=True)
+    X_train = torch.tensor(np.array(X_list, dtype=np.float32)).to(device)
+    y_train = torch.tensor(np.array(y_list, dtype=np.float32)).reshape(-1, 1).to(device)
 
-    # Init Predictor
-    predictor = KANPredictor(obs_dim, hidden_dim)
-    optimizer_pred = optim.Adam(predictor.parameters(), lr=0.0001)
-    criterion = nn.MSELoss()
+    predictor = KANPredictor(env.obs_shape, hidden_dim=32).to(device)
+    opt_pred = optim.Adam(predictor.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
 
-    # Train Loop
-    epochs = 100
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch_X, batch_y in dataloader:
-            optimizer_pred.zero_grad()
-            preds = predictor(batch_X)
-            loss = criterion(preds, batch_y)
-            loss.backward()
-            optimizer_pred.step()
-            total_loss += loss.item()
-
-        if (epoch+1) % 5 == 0:
-            print(f"   Epoch {epoch+1}/{epochs} | MSE Loss: {total_loss/len(dataloader):.6f}")
+    for epoch in range(2000):
+        opt_pred.zero_grad()
+        loss = loss_fn(predictor(X_train), y_train)
+        loss.backward()
+        opt_pred.step()
+        if epoch % 50 == 0: print(f"   Epoch {epoch}: Loss {loss.item():.4f}")
 
     print("✅ Pre-training complete. Weights primed.")
+    # Let's run for 200,000 steps (Sufficient for a specialist)
+    TOTAL_STEPS = 10000
 
-    # ==========================================
-    # PHASE 2: RL TRAINING (PPO)
-    # ==========================================
-    print("\n🎮 PHASE 2: Transferring Weights & Starting RL...")
+    for step in range(1, TOTAL_STEPS + 1):
 
-    # Pass the TRAINED BODY to the Agent
-    agent = KANActorCritic(obs_dim, action_dim, hidden_dim, pretrained_body=predictor.body)
-    optimizer_rl = optim.Adam(agent.parameters(), lr=0.0005) # Lower LR for fine-tuning
-
-    # Reset Logger
-    logger = TradingLogger()
-
-    # PPO Params
-    state, _ = env.reset()
-    episode_reward = 0
-    memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
-
-    for step in range(1, 20000):
-        # -- Action --
+        # --- A. AGENT INTERACTION ---
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
         action, log_prob, _ = agent.act(state_tensor)
 
-        # -- Logging --
+        # Log data BEFORE stepping (so we capture the state that generated the action)
         current_idx = env.current_step
         try:
             date = env.df.index[current_idx]
-            open_price = float(env.df['Open'].iloc[current_idx]) if 'Open' in env.df.columns else None
-            high_price = float(env.df['High'].iloc[current_idx]) if 'High' in env.df.columns else None
-            low_price = float(env.df['Low'].iloc[current_idx]) if 'Low' in env.df.columns else None
             real_close = float(env.df['Close'].iloc[current_idx])
-        except Exception:
-            date, open_price, high_price, low_price, real_close = None, None, None, None, None
+            # Handle missing columns safely
+            open_p = env.df['Open'].iloc[current_idx] if 'Open' in env.df else 0
+            high_p = env.df['High'].iloc[current_idx] if 'High' in env.df else 0
+            low_p = env.df['Low'].iloc[current_idx] if 'Low' in env.df else 0
+        except:
+            date, real_close, open_p, high_p, low_p = None, 0, 0, 0, 0
 
         act_str = ["skip", "buy", "sell"][int(action)]
+        logger.log_step(date, open_p, high_p, low_p, real_close, None, act_str)
 
-        # Predicted close: predictor predicts next log-return (if available)
-        pred_close = None
-        try:
-            with torch.no_grad():
-                pred_logret = predictor(state_tensor)
-                # predictor output shape: (1,1)
-                pred_close = float(real_close * np.exp(pred_logret.item())) if real_close is not None else None
-        except Exception:
-            pred_close = None
-
-        logger.log_step(date, open_price, high_price, low_price, real_close, pred_close, act_str)
-
-        # -- Step --
         next_state, reward, done, _, _ = env.step(action)
 
-        # -- Memory --
+        # --- B. STORE MEMORY ---
         memory_states.append(torch.FloatTensor(state))
         memory_actions.append(torch.tensor(action))
         memory_logprobs.append(log_prob)
         memory_rewards.append(reward)
+        recent_rewards.append(reward)
 
+        # --- C. MOVE STATE FORWARD ---
         state = next_state
-        episode_reward += reward
 
-        # -- Update (PPO) --
-        if step % 500 == 0:
+        # --- D. PPO UPDATE (THE LEARNING & FEEDBACK PHASE) ---
+        if step % UPDATE_FREQ == 0:
+            # 1. Prepare Batch
             old_states = torch.stack(memory_states)
             old_actions = torch.stack(memory_actions)
             old_logprobs = torch.stack(memory_logprobs)
 
-            # Rewards
+            # 2. Compute Discounted Rewards (Monte Carlo)
             rewards = []
             discounted_reward = 0
             for r in reversed(memory_rewards):
-                discounted_reward = r + 0.99 * discounted_reward
+                discounted_reward = r + GAMMA * discounted_reward
                 rewards.insert(0, discounted_reward)
             rewards = torch.tensor(rewards, dtype=torch.float32)
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-            # Optimization
-            for _ in range(3):
+            # 3. Optimize (PPO Steps)
+            for _ in range(K_EPOCHS):
                 logprobs, state_values, dist_entropy = agent.evaluate(old_states, old_actions)
                 state_values = torch.squeeze(state_values)
                 ratios = torch.exp(logprobs - old_logprobs.detach())
                 advantages = rewards - state_values.detach()
                 surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
+                surr2 = torch.clamp(ratios, 1-EPS_CLIP, 1+EPS_CLIP) * advantages
                 loss = -torch.min(surr1, surr2) + 0.5 * nn.MSELoss()(state_values, rewards) - 0.01 * dist_entropy
 
-                optimizer_rl.zero_grad()
+                optimizer.zero_grad()
                 loss.mean().backward()
-                optimizer_rl.step()
+                optimizer.step()
 
+            # 4. Clear Memory
             memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
 
+            # 5. Feedback Log (LIVE DASHBOARD)
+            avg_rew = sum(recent_rewards) / len(recent_rewards)
+            print(f"\n🔄 Step {step}/{TOTAL_STEPS} | Avg Reward: {avg_rew:.4f}")
+
+            # --- <NEW CODE START> ---
+            # Get current running stats from the logger
+            current_results = logger.get_results()
+            if not current_results.empty:
+                # Calculate Running Profit for THIS episode so far
+                running_profit = current_results['Profit'].sum()
+                print(f"   💰 Running Profit: {running_profit:.2f}")
+
+                # Show last 5 trades to see what it's doing right now
+                cols = [c for c in ["Date", "Real_Close", "Action", "Profit"] if c in current_results.columns]
+                print(current_results[cols].tail(5).to_string(index=False))
+            # --- <NEW CODE END> ---
+
+        # --- E. RESET IF DONE ---
         if done:
-            print(f"🏁 Episode Result: Total Reward: {episode_reward:.2f}")
+            print(f"\n🏁 Episode Finished.")
+            # We don't need to print here anymore since we print every update,
+            # but it's good to keep a final summary.
             results = logger.get_results()
             if not results.empty:
-                print(f"   Profit: {results['Profit'].sum():.2f}")
-                # Print recent trades with detailed columns
-                cols = [c for c in ["Date", "Open", "High", "Low", "Real_Close", "Pred_Close", "Action", "Profit", "Miss_Opportunity"] if c in results.columns]
-                try:
-                    print("\n   Recent Trades:")
-                    print(results[cols].tail(10).to_string(index=False))
-                except Exception:
-                    # Fallback: print raw tail
-                    print(results.tail(10))
+                print(f"   TOTAL PROFIT: {results['Profit'].sum():.2f}")
 
             # Reset for next episode
             state, _ = env.reset()
             episode_reward = 0
-            torch.save(agent.state_dict(), "kan_agent.pth")
-            logger = TradingLogger() # CRITICAL: Reset logger to avoid ghost inventory
+            torch.save(agent.state_dict(), "kan_agent_guardian.pth")
+            logger = TradingLogger() # Reset logger
 def run_backtest():
     # 1. SETUP: Define Split Dates
-    TICKER = "^IXIC"
+    TICKER = "NVDA"
     # We test on data the model (hopefully) hasn't seen
-    TEST_START  = "2025-06-01"
+    TEST_START  = "2025-01-01"
     TEST_END    = "2025-12-08" # Or current date
 
     print(f"⚔️ REALITY CHECK: Backtesting {TICKER}")
@@ -661,7 +730,7 @@ def run_backtest():
 
     # Load Weights
     try:
-        agent.load_state_dict(torch.load("kan_agent.pth"))
+        agent.load_state_dict(torch.load("kan_agent_guardian.pth"))
         print("✅ Trained Model Loaded Successfully.")
     except FileNotFoundError:
         print("❌ ERROR: No model found. Please Train and torch.save() first!")
@@ -733,9 +802,6 @@ def run_backtest():
         print(f"\n📊 FINAL REPORT")
         print(f"   Agent Return:      {agent_return:.2f}%")
         print(f"   Buy & Hold Return: {bh_return:.2f}%")
-
-
 if __name__ == "__main__":
-    run_pipeline()
-    for i in range(10):
-        run_backtest()
+    train_guardian()
+    run_backtest()

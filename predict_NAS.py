@@ -1,35 +1,31 @@
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 import math
+import pandas_ta as ta
 import warnings
 
-# Suppress yfinance warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-
 # ==============================================================================
-# 1. PASTE YOUR MODEL CLASSES HERE
-# (Must match training EXACTLY so torch.load works)
+# 1. KAN CLASSES (MUST MATCH TRAINING EXACTLY)
 # ==============================================================================
+# Use CPU for prediction (easier/cheaper than loading CUDA just for 1 number)
+device = torch.device("cpu")
 
 class KANLinear(nn.Module):
-    def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0,
-                 scale_spline=1.0, enable_standalone_scale_spline=True, base_activation=torch.nn.SiLU, grid_eps=0.02,
-                 grid_range=[-1, 1]):
+    def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0, enable_standalone_scale_spline=True, base_activation=torch.nn.SiLU, grid_eps=0.02, grid_range=[-1, 1]):
         super(KANLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.grid_size = grid_size
         self.spline_order = spline_order
         h = (grid_range[1] - grid_range[0]) / grid_size
-        grid = ((torch.arange(-spline_order, grid_size + spline_order + 1) * h + grid_range[0]).expand(in_features,
-                                                                                                       -1).contiguous())
+        grid = ((torch.arange(-spline_order, grid_size + spline_order + 1) * h + grid_range[0]).expand(in_features, -1).contiguous())
         self.register_buffer("grid", grid)
         self.base_weight = nn.Parameter(torch.Tensor(out_features, in_features))
         self.spline_weight = nn.Parameter(torch.Tensor(out_features, in_features, grid_size + spline_order))
@@ -46,11 +42,8 @@ class KANLinear(nn.Module):
     def reset_parameters(self):
         torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
         with torch.no_grad():
-            noise = ((torch.rand(self.grid_size + self.spline_order, self.in_features,
-                                 self.out_features) - 1 / 2) * self.scale_noise / self.grid_size)
-            self.spline_weight.data.copy_(
-                (self.scale_spline if not self.enable_standalone_scale_spline else 1.0) * self.curve2coeff(
-                    self.grid.T[self.spline_order: -self.spline_order], noise))
+            noise = ((torch.rand(self.grid_size + self.spline_order, self.in_features, self.out_features) - 1 / 2) * self.scale_noise / self.grid_size)
+            self.spline_weight.data.copy_((self.scale_spline if not self.enable_standalone_scale_spline else 1.0) * self.curve2coeff(self.grid.T[self.spline_order : -self.spline_order], noise))
             if self.enable_standalone_scale_spline:
                 torch.nn.init.kaiming_uniform_(self.spline_scaler, a=math.sqrt(5) * self.scale_spline)
 
@@ -60,8 +53,7 @@ class KANLinear(nn.Module):
         x = x.unsqueeze(-1)
         bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
         for k in range(1, self.spline_order + 1):
-            bases = ((x - grid[:, : -(k + 1)]) / (grid[:, k:-1] - grid[:, : -(k + 1)]) * bases[:, :, :-1]) + (
-                        (grid[:, k + 1:] - x) / (grid[:, k + 1:] - grid[:, 1:(-k)]) * bases[:, :, 1:])
+            bases = ((x - grid[:, : -(k + 1)]) / (grid[:, k:-1] - grid[:, : -(k + 1)]) * bases[:, :, :-1]) + ((grid[:, k + 1 :] - x) / (grid[:, k + 1 :] - grid[:, 1:(-k)]) * bases[:, :, 1:])
         assert bases.size() == (x.size(0), self.in_features, self.grid_size + self.spline_order)
         return bases
 
@@ -83,7 +75,6 @@ class KANLinear(nn.Module):
             output = output.view(original_shape[0], original_shape[1], self.out_features)
         return output
 
-
 class KANBody(nn.Module):
     def __init__(self, obs_dim, hidden_dim=64):
         super(KANBody, self).__init__()
@@ -99,42 +90,36 @@ class KANBody(nn.Module):
         x = self.ln2(x)
         return x
 
-
 class KANActorCritic(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim=64, pretrained_body=None):
+    def __init__(self, obs_dim, action_dim, hidden_dim=64):
         super(KANActorCritic, self).__init__()
-        if pretrained_body:
-            self.body = pretrained_body
-        else:
-            self.body = KANBody(obs_dim, hidden_dim)
+        self.body = KANBody(obs_dim, hidden_dim)
         self.actor_head = nn.Linear(hidden_dim, action_dim)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
     def act(self, state):
         features = self.body(state)
         logits = self.actor_head(features)
-
-        # --- THE FIX IS HERE ---
-        # OLD WAY (Training): dist.sample() -> Random based on %
-        # NEW WAY (Prediction): torch.argmax() -> Always picks the highest %
+        # Use ARGMAX for Prediction (Best Guess)
         action = torch.argmax(logits, dim=1)
-
         return action.item()
 
-
 # ==============================================================================
-# 2. THE PREDICTION LOGIC
+# 2. PREDICTION LOGIC
 # ==============================================================================
+def predict_nasdaq():
+    TICKER = "^IXIC"
+    MODEL_FILE = "kan_agent_nasdaq.pth"
 
-def get_recommendation(ticker="NVDA"):
-    print(f"\n🔮 Analyzing {ticker} for Tomorrow...")
+    print(f"\n🔮 Analyzing NASDAQ ({TICKER}) for Tomorrow...")
 
     # 1. Fetch Data
-    df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
+    # Fetch extra days to ensure indicators are calculated correctly
+    df = yf.download(TICKER, period="6mo", interval="1d", progress=False, auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 2. Feature Engineering
+    # 2. Feature Engineering (Exact Match to Training)
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_Norm'] = df['Volume'] / df['Volume'].rolling(20).mean()
     df.ta.rsi(length=14, append=True)
@@ -148,70 +133,58 @@ def get_recommendation(ticker="NVDA"):
 
     features = ["Close", "Log_Ret", "Vol_Norm", "RSI_14", "MACD_12_26_9"]
 
-    # 3. Check Data Length
-    if len(df) < 10:
+    # 3. Prepare Input
+    if len(df) < 30:
         print("❌ Not enough data.")
         return
 
-    # 4. Prepare Observation
-    window = df[features].iloc[-10:].values
+    window = df[features].iloc[-30:].values
     obs = window.flatten().astype(np.float32)
-    obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+    state_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
 
-    # 5. Load Model
-    # IMPORTANT: Ensure hidden_dim matches your saved model (likely 32 or 64)
-    agent = KANActorCritic(obs_dim=50, action_dim=3, hidden_dim=32)
+    # 4. Load Model
+    # obs_dim = 30 * 5 = 150
+    agent = KANActorCritic(obs_dim=150, action_dim=3, hidden_dim=32).to(device)
+
     try:
-        agent.load_state_dict(torch.load("kan_agent.pth", weights_only=True))
+        agent.load_state_dict(torch.load(MODEL_FILE, map_location=device, weights_only=True))
         agent.eval()
-    except FileNotFoundError:
-        print("❌ Model 'kan_agent.pth' not found.")
+    except Exception as e:
+        print(f"❌ Model Error: {e}")
         return
 
-    # 6. Predict
+    # 5. Predict
     with torch.no_grad():
-        action = agent.act(obs_tensor)
+        action = agent.act(state_tensor)
 
-    # 7. DISPLAY RESULTS
+    # 6. Display Result
     current_price = df['Close'].iloc[-1]
-    rsi_display = df['RSI_14'].iloc[-1] * 100
-    macd_display = df['MACD_12_26_9'].iloc[-1]
 
-    print(f"   Price: ${current_price:.2f}")
-    print(f"   RSI: {rsi_display:.1f}  |  MACD: {macd_display:.2f}")
+    print("-" * 40)
+    print(f"   Current Level: {current_price:.2f}")
     print("-" * 40)
 
-    # --- THE NEW TRADE PLANNER ---
-    if action == 1:  # BUY
-        # Calculate Logic
-        stop_loss_price = current_price * 0.95  # -5%
-        take_profit_price = current_price * 1.20  # +20%
+    if action == 1: # BUY
+        print("🚀 SIGNAL: BUY (LONG)")
+        print("   Reasoning: Model detects uptrend momentum.")
 
-        print("🚀 SIGNAL: BUY")
-        print("   Reasoning: Model detects upward momentum.")
-        print("-" * 40)
-        print("📋 TRADE PLAN (Enter this into Webull):")
-        print(f"   1. ENTRY:      ${current_price:.2f} (Market Order)")
-        print(f"   2. STOP LOSS:  ${stop_loss_price:.2f} (-5%)")
-        print(f"   3. TAKE PROFIT:${take_profit_price:.2f} (+20%)")
+        # STOP LOSS: -2% (Tighter for Prop Firms)
+        sl = current_price * 0.98
+        # TAKE PROFIT: +4%
+        tp = current_price * 1.04
 
-    elif action == 2:  # SELL
-        print("🔴 SIGNAL: SELL")
-        print("   Reasoning: Model detects weakness/downtrend.")
-        print("   Action: Close any open positions immediately.")
+        print(f"   🛑 STOP LOSS:   {sl:.2f} (-2.0%)")
+        print(f"   🎯 TAKE PROFIT: {tp:.2f} (+4.0%)")
 
-    else:  # SKIP
+    elif action == 2: # SELL
+        print("🔴 SIGNAL: SELL / CLOSE")
+        print("   Action: Close Longs. (If trading CFDs, consider Shorting).")
+
+    else: # SKIP
         print("💤 SIGNAL: HOLD / WAIT")
-        print("   Reasoning: Market is indecisive.")
-        print("   Action: If you hold shares, keep holding. If cash, stay cash.")
-    print("-" * 40)
+        print("   Action: Stay in Cash or Hold current position.")
 
+    print("-" * 40)
 
 if __name__ == "__main__":
-    # Multi-Stock Loop
-    tickers = ["NVDA"]
-    for t in tickers:
-        try:
-            get_recommendation(t)
-        except Exception as e:
-            print(f"⚠️ Error analyzing {t}: {e}")
+    predict_nasdaq()
