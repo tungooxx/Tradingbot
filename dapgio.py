@@ -23,7 +23,7 @@ def set_seed(seed=42):
     # This ensures exact reproducibility
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 set_seed(42) # Call this!
 class KANLinear(nn.Module):
     def __init__(
@@ -284,15 +284,20 @@ class TradingLogger:
         return final
 
 class StockTradingEnv(gym.Env):
-    def __init__(self, ticker="^IXIC", window_size=30):
+    def __init__(self, ticker="NVDA", window_size=30, mode="train"):
         super(StockTradingEnv, self).__init__()
         print(f"📥 Downloading {ticker} data...")
-        self.df = yf.download(ticker, period="5y", interval="1d", progress=False)
+        raw_df = yf.download(ticker, period="5y", interval="1d", progress=False, auto_adjust=True)
 
         # Fix MultiIndex (yfinance update)
-        if isinstance(self.df.columns, pd.MultiIndex):
-            self.df.columns = self.df.columns.get_level_values(0)
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            raw_df.columns = raw_df.columns.get_level_values(0)
+        split_idx = int(len(raw_df) * 0.8)
 
+        if mode == "train":
+            self.df = raw_df.iloc[:split_idx].copy()
+        else:
+            self.df = raw_df.iloc[split_idx:].copy()
         # ==========================================
         # 1. CALCULATE ALL INDICATORS & FEATURES
         # ==========================================
@@ -453,7 +458,7 @@ def prepare_pretraining_data(env):
 
 def run_pipeline():
     # 1. Init Env
-    env = StockTradingEnv(ticker='^IXIC', window_size=30)
+    env = StockTradingEnv(ticker='NVDA', window_size=30)
     obs_dim = env.obs_shape
     action_dim = env.action_space.n
     hidden_dim = 32 # Keep small for speed
@@ -461,32 +466,25 @@ def run_pipeline():
     # ==========================================
     # PHASE 1: PRE-TRAINING (SUPERVISED)
     # ==========================================
-    print("\n🧠 PHASE 1: Pre-training KAN Predictor...")
+    print("\n🧠 PHASE 1: Pre-training on PAST Data...")
+    X_list, y_list = [], []
+    for i in range(env.window_size, len(env.data) - 1):
+        X_list.append(env.data[i - env.window_size : i].flatten())
+        y_list.append(env.data[i][1] * 100)
 
-    # Create dataset
-    X_train, y_train = prepare_pretraining_data(env)
-    dataset = torch.utils.data.TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=True)
+    X_train = torch.tensor(np.array(X_list, dtype=np.float32)).to(device)
+    y_train = torch.tensor(np.array(y_list, dtype=np.float32)).reshape(-1, 1).to(device)
 
-    # Init Predictor
-    predictor = KANPredictor(obs_dim, hidden_dim)
-    optimizer_pred = optim.Adam(predictor.parameters(), lr=0.0001)
-    criterion = nn.MSELoss()
+    predictor = KANPredictor(env.obs_shape, hidden_dim=32).to(device)
+    opt_pred = optim.Adam(predictor.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
 
-    # Train Loop
-    epochs = 100
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch_X, batch_y in dataloader:
-            optimizer_pred.zero_grad()
-            preds = predictor(batch_X)
-            loss = criterion(preds, batch_y)
-            loss.backward()
-            optimizer_pred.step()
-            total_loss += loss.item()
-
-        if (epoch+1) % 5 == 0:
-            print(f"   Epoch {epoch+1}/{epochs} | MSE Loss: {total_loss/len(dataloader):.6f}")
+    for epoch in range(150):
+        opt_pred.zero_grad()
+        loss = loss_fn(predictor(X_train), y_train)
+        loss.backward()
+        opt_pred.step()
+        if epoch % 50 == 0: print(f"   Epoch {epoch}: Loss {loss.item():.4f}")
 
     print("✅ Pre-training complete. Weights primed.")
 
@@ -509,7 +507,7 @@ def run_pipeline():
 
     for step in range(1, 20000):
         # -- Action --
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
         action, log_prob, _ = agent.act(state_tensor)
 
         # -- Logging --
@@ -601,7 +599,7 @@ def run_pipeline():
             logger = TradingLogger() # CRITICAL: Reset logger to avoid ghost inventory
 def run_backtest():
     # 1. SETUP: Define Split Dates
-    TICKER = "^IXIC"
+    TICKER = "NVDA"
     # We test on data the model (hopefully) hasn't seen
     TEST_START  = "2025-06-01"
     TEST_END    = "2025-12-08" # Or current date
@@ -688,7 +686,7 @@ def run_backtest():
     print("\n🚀 Starting Backtest Loop...")
 
     while not done:
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
 
         with torch.no_grad():
             action, _, _ = agent.act(state_tensor)

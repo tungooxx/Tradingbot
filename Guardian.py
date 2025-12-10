@@ -283,76 +283,47 @@ class TradingLogger:
         return final
 
 class StockTradingEnv(gym.Env):
-    def __init__(self, ticker="NVDA", window_size=10):
+    def __init__(self, ticker="^IXIC", window_size=30, mode="train"):
         super(StockTradingEnv, self).__init__()
-        print(f"📥 Downloading {ticker} data...")
-        self.df = yf.download(ticker, period="5y", interval="1d", progress=False)
+        print(f"🛡️ Initializing GUARDIAN (Safety First) for {mode.upper()}...")
 
-        # Fix MultiIndex (yfinance update)
-        if isinstance(self.df.columns, pd.MultiIndex):
-            self.df.columns = self.df.columns.get_level_values(0)
+        # 1. Download Data
+        raw_df = yf.download(ticker, period="5y", interval="1d", progress=False, auto_adjust=True)
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            raw_df.columns = raw_df.columns.get_level_values(0)
 
-        # ==========================================
-        # 1. CALCULATE ALL INDICATORS & FEATURES
-        # ==========================================
-        # A. Basic Features (Returns & Vol)
+        # 2. TIME SPLIT (Prevent Leakage)
+        split_idx = int(len(raw_df) * 0.8)
+
+        if mode == "train":
+            self.df = raw_df.iloc[:split_idx].copy() # 2019-2023
+        else:
+            self.df = raw_df.iloc[split_idx:].copy() # 2024-2025
+
+        # Feature Engineering (Standard)
         self.df["Log_Ret"] = np.log(self.df["Close"] / self.df["Close"].shift(1))
         self.df["Vol_Norm"] = self.df["Volume"] / self.df["Volume"].rolling(20).mean()
-
-        # B. Technical Indicators (pandas_ta)
         self.df.ta.rsi(length=14, append=True)
         self.df.ta.macd(fast=12, slow=26, signal=9, append=True)
-        # Note: Bollinger Bands adds 3 columns (Lower, Mid, Upper).
-        # We aren't using them in 'self.features' yet, but good to have.
-        self.df.ta.bbands(length=20, std=2, append=True)
-
-        # ==========================================
-        # 2. CLEAN & NORMALIZE
-        # ==========================================
-        # Drop NaNs created by rolling windows (Vol_Norm needs 20 days, MACD needs 26)
         self.df.dropna(inplace=True)
 
-        # Normalize Technicals
-        # RSI is 0-100 -> Scale to 0-1
+        # Normalize
         self.df["RSI_14"] = self.df["RSI_14"] / 100.0
+        self.df["MACD_12_26_9"] = (self.df["MACD_12_26_9"] - self.df["MACD_12_26_9"].mean()) / (self.df["MACD_12_26_9"].std() + 1e-7)
 
-        # MACD is unbounded -> Standard Score Normalization
-        self.df["MACD_12_26_9"] = (
-            self.df["MACD_12_26_9"] - self.df["MACD_12_26_9"].mean()
-        ) / (self.df["MACD_12_26_9"].std() + 1e-7)
-
-        # ==========================================
-        # 3. DEFINE OBSERVATION SPACE
-        # ==========================================
-        # Define the 5 columns we want the AI to see
         self.features = ["Close", "Log_Ret", "Vol_Norm", "RSI_14", "MACD_12_26_9"]
-
-        # Create the data matrix
         self.data = self.df[self.features].values
-
-        # Set limits
         self.window_size = window_size
         self.max_steps = len(self.data) - 1
-
-        # Spaces
         self.action_space = spaces.Discrete(3)
-
-        # Update Shape: Window * Number of Features (10 * 5 = 50)
         self.obs_shape = window_size * len(self.features)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.obs_shape,), dtype=np.float32
-        )
 
     def reset(self, seed=None):
         super().reset(seed=seed)
         self.current_step = self.window_size
-        # Step 3: start with $20 balance
-        self.balance = 20.0
+        self.balance = 100.0
         self.shares = 0
         self.entry_price = 0
-        # Fixed dollar amount to invest per BUY action
-        self.invest_amount = 1.0
-        self.prev_net_worth = self.balance
         return self._get_observation(), {}
 
     def _get_observation(self, step=None):
@@ -363,60 +334,56 @@ class StockTradingEnv(gym.Env):
     def step(self, action):
         current_price = self.data[self.current_step][0]
         daily_log_ret = self.data[self.current_step][1]
-
         reward = 0
         done = False
 
-        # --- 1. ACTION LOGIC (Buy/Sell) ---
-        if action == 1:  # BUY
-            if self.shares == 0 and self.balance > 0:
+        # --- 1. ACTION LOGIC ---
+        if action == 1: # BUY
+            if self.shares == 0:
                 self.shares = self.balance / current_price
                 self.balance = 0.0
                 self.entry_price = current_price
-                reward -= 0.05  # Tiny penalty for entry
+                # NO ENTRY BONUS for Guardian. It shouldn't be eager.
 
-        elif action == 2:  # SELL
+        elif action == 2: # SELL
             if self.shares > 0:
                 gross_val = self.shares * current_price
-                net_val = gross_val * 0.999
-                cost_basis = self.shares * self.entry_price
-                profit_dollars = net_val - cost_basis
-                reward = (profit_dollars / cost_basis) * 100
-                self.balance = net_val
+                self.balance = gross_val * 0.999
+                # Reward Profit, but less aggressively than Surfer
+                profit_pct = (gross_val - (self.shares * self.entry_price))/(self.shares * self.entry_price)
+                reward = profit_pct * 10
                 self.shares = 0
                 self.entry_price = 0
 
-        # --- 2. HOLDING LOGIC (Safety Checks + Compass) ---
+        # --- 2. HOLDING LOGIC (STRICT) ---
         if self.shares > 0:
             current_return = (current_price - self.entry_price) / self.entry_price
 
-            # A. STOP LOSS (-5%)
+            # A. STOP LOSS (STRICTER)
+            # If Guardian loses money, it gets SMASHED.
             if current_return < -0.05:
-                gross_val = self.shares * current_price
-                self.balance = gross_val * 0.999
-                self.shares = 0.0
-                self.entry_price = 0.0
-                reward = -5.0  # Big Punishment
+                self.balance = self.shares * current_price * 0.999
+                self.shares = 0
+                reward = -10.0 # Double Penalty (Surfer was -5.0)
 
-            # B. TAKE PROFIT (+20%)
+            # B. TAKE PROFIT
             elif current_return > 0.20:
-                gross_val = self.shares * current_price
-                self.balance = gross_val * 0.999
-                self.shares = 0.0
-                self.entry_price = 0.0
-                reward = +20.0  # Big Reward
+                self.balance = self.shares * current_price * 0.999
+                self.shares = 0
+                reward = +10.0
 
-            # C. THE COMPASS (Daily Feedback)
-            # If we didn't hit SL or TP, tell the agent how today went.
             else:
-                # Give it the daily return as a cookie + small holding bonus
-                # This fixes the "Sparse Reward" problem
-                reward += (daily_log_ret * 10) + 0.01
+                # Standard Holding Reward
+                reward += (daily_log_ret * 10)
+
+        # --- 3. NO BOREDOM PENALTY ---
+        else:
+            # The Guardian is allowed to sit in cash.
+            # Reward = 0. This is "Safe".
+            reward += 0.0
 
         self.current_step += 1
-        if self.current_step >= self.max_steps:
-            done = True
-
+        if self.current_step >= self.max_steps: done = True
         return self._get_observation(), reward, done, False, {}
 
 # Inherit from your original environment
@@ -521,7 +488,7 @@ def train_guardian():
     logger = TradingLogger()
     # 1. Use the NEW Guardian Environment
     # We use window_size=30 to match your standard architecture
-    env = GuardianStockEnv(ticker="NVDA", window_size=30)
+    env = GuardianStockEnv(ticker="^IXIC", window_size=30)
 
     # 2. Setup Agent & Optimizer
     obs_dim = env.obs_shape
@@ -560,7 +527,7 @@ def train_guardian():
     opt_pred = optim.Adam(predictor.parameters(), lr=0.001)
     loss_fn = nn.MSELoss()
 
-    for epoch in range(2000):
+    for epoch in range(150):
         opt_pred.zero_grad()
         loss = loss_fn(predictor(X_train), y_train)
         loss.backward()
@@ -670,7 +637,7 @@ def train_guardian():
             logger = TradingLogger() # Reset logger
 def run_backtest():
     # 1. SETUP: Define Split Dates
-    TICKER = "NVDA"
+    TICKER = "^IXIC"
     # We test on data the model (hopefully) hasn't seen
     TEST_START  = "2025-01-01"
     TEST_END    = "2025-12-08" # Or current date

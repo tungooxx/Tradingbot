@@ -3,18 +3,19 @@ import pandas as pd
 import yfinance as yf
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
-import math
 import pandas_ta as ta
-import matplotlib.pyplot as plt
 import warnings
+import torch.nn.functional as F
 
+# Suppress warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # ==============================================================================
-# 1. DEFINE MODELS (MUST MATCH TRAINING EXACTLY)
+# 1. SETUP: KAN & AGENT CLASSES
 # ==============================================================================
+# Use CPU for prediction (Simpler)
+device = torch.device("cpu")
+
 class KANLinear(nn.Module):
     def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0, enable_standalone_scale_spline=True, base_activation=torch.nn.SiLU, grid_eps=0.02, grid_range=[-1, 1]):
         super(KANLinear, self).__init__()
@@ -38,21 +39,19 @@ class KANLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
+        torch.nn.init.kaiming_uniform_(self.base_weight, a=5**0.5 * self.scale_base)
         with torch.no_grad():
             noise = ((torch.rand(self.grid_size + self.spline_order, self.in_features, self.out_features) - 1 / 2) * self.scale_noise / self.grid_size)
             self.spline_weight.data.copy_((self.scale_spline if not self.enable_standalone_scale_spline else 1.0) * self.curve2coeff(self.grid.T[self.spline_order : -self.spline_order], noise))
             if self.enable_standalone_scale_spline:
-                torch.nn.init.kaiming_uniform_(self.spline_scaler, a=math.sqrt(5) * self.scale_spline)
+                torch.nn.init.kaiming_uniform_(self.spline_scaler, a=5**0.5 * self.scale_spline)
 
     def b_splines(self, x: torch.Tensor):
-        assert x.dim() == 2 and x.size(1) == self.in_features
         grid: torch.Tensor = self.grid
         x = x.unsqueeze(-1)
         bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
         for k in range(1, self.spline_order + 1):
             bases = ((x - grid[:, : -(k + 1)]) / (grid[:, k:-1] - grid[:, : -(k + 1)]) * bases[:, :, :-1]) + ((grid[:, k + 1 :] - x) / (grid[:, k + 1 :] - grid[:, 1:(-k)]) * bases[:, :, 1:])
-        assert bases.size() == (x.size(0), self.in_features, self.grid_size + self.spline_order)
         return bases
 
     def curve2coeff(self, x: torch.Tensor, y: torch.Tensor):
@@ -80,7 +79,6 @@ class KANBody(nn.Module):
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.layer2 = KANLinear(hidden_dim, hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
-
     def forward(self, x):
         x = self.layer1(x)
         x = self.ln1(x)
@@ -98,12 +96,11 @@ class KANActorCritic(nn.Module):
     def act(self, state):
         features = self.body(state)
         logits = self.actor_head(features)
-        # Use argmax for deterministic testing
         action = torch.argmax(logits, dim=1)
         return action.item(), None, self.critic_head(features)
 
 # ==============================================================================
-# 2. THE COUNCIL CLASS
+# 2. COUNCIL CLASS
 # ==============================================================================
 class Council(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_dim=64):
@@ -112,18 +109,18 @@ class Council(nn.Module):
         self.guardian = KANActorCritic(obs_dim, action_dim, hidden_dim)
 
     def load_experts(self, surfer_path, guardian_path):
-        # Load Surfer
         try:
-            self.surfer.load_state_dict(torch.load(surfer_path, weights_only=True))
-        except Exception as e:
-            print(f"❌ Error loading Surfer: {e}")
+            self.surfer.load_state_dict(torch.load(surfer_path, map_location=device, weights_only=True))
+            print("✅ Surfer Loaded.")
+        except:
+            print(f"❌ ERROR: Could not load {surfer_path}")
             return False
 
-        # Load Guardian
         try:
-            self.guardian.load_state_dict(torch.load(guardian_path, weights_only=True))
-        except Exception as e:
-            print(f"❌ Error loading Guardian: {e}")
+            self.guardian.load_state_dict(torch.load(guardian_path, map_location=device, weights_only=True))
+            print("✅ Guardian Loaded.")
+        except:
+            print(f"❌ ERROR: Could not load {guardian_path}")
             return False
 
         self.surfer.eval()
@@ -136,35 +133,36 @@ class Council(nn.Module):
             _, _, guardian_value = self.guardian.act(state_tensor)
             fear_level = guardian_value.item()
 
-            # 2. Veto Check
-            if fear_level < veto_threshold:
-                return 2 # SELL (Vetoed)
-
-            # 3. Ask Surfer (Profit)
+            # 2. Ask Surfer (Profit)
             surfer_action, _, _ = self.surfer.act(state_tensor)
-            return surfer_action
+
+            # 3. Logic
+            vetoed = False
+            final_action = surfer_action
+
+            if fear_level < veto_threshold:
+                final_action = 2 # Forced Sell
+                vetoed = True
+
+            return final_action, surfer_action, fear_level, vetoed
 
 # ==============================================================================
-# 3. THE OPTIMIZATION LOOP
+# 3. PREDICTION FUNCTION
 # ==============================================================================
-def run_optimization():
-    # --- A. SETUP ---
-    TICKER = "^IXIC" # or NVDA
-    START_BAL = 500.0
-    THRESHOLDS = [-0.01,-0.05,-0.1, -0.5, -1.0, -2.0, -5.0, 0, 0.01, 0.05] # Test these fear levels
-    # -0.1 = Very Paranoid (Sells everything)
-    # -5.0 = Very Relaxed (Only sells if market is dying)
+def predict_council_decision():
+    # --- CONFIGURATION ---
+    TICKER = "^IXIC"
+    VETO_THRESHOLD = -0.5  # Set this to your "Winner" from optimization
+    SURFER_FILE = "kan_agent.pth"
+    GUARDIAN_FILE = "kan_agent_guardian.pth"
 
-    print(f"🏛️ COUNCIL OPTIMIZATION: {TICKER}")
-    print(f"   Starting Balance: ${START_BAL}")
-    print(f"   Testing Thresholds: {THRESHOLDS}")
+    print(f"\n🏛️ COUNCIL MEETING: Analyzing {TICKER}...")
 
-    # --- B. LOAD DATA ---
-    df = yf.download(TICKER, period="1y", interval="1d", progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    # 1. Fetch Data
+    df = yf.download(TICKER, period="6mo", interval="1d", progress=False, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-    # Feature Engineering (Must match training)
+    # 2. Features (Exact Match)
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_Norm'] = df['Volume'] / df['Volume'].rolling(20).mean()
     df.ta.rsi(length=14, append=True)
@@ -176,98 +174,48 @@ def run_optimization():
     df["MACD_12_26_9"] = (df["MACD_12_26_9"] - df["MACD_12_26_9"].mean()) / (df["MACD_12_26_9"].std() + 1e-7)
 
     features = ["Close", "Log_Ret", "Vol_Norm", "RSI_14", "MACD_12_26_9"]
-    data_values = df[features].values
-    window_size = 15
+    window = df[features].iloc[-30:].values
+    obs = window.flatten().astype(np.float32)
+    state_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
 
-    # --- C. INIT COUNCIL ---
-    # Ensure hidden_dim matches your saved files (try 32 or 64)
-    council = Council(75, 3, hidden_dim=32)
-    loaded = council.load_experts("kan_agent_nasdaq.pth", "kan_agent_guardian.pth")
-
-    if not loaded:
+    # 3. Init Council
+    council = Council(150, 3, hidden_dim=32).to(device)
+    if not council.load_experts(SURFER_FILE, GUARDIAN_FILE):
         return
 
-    # --- D. RUN SIMULATIONS ---
-    results = {}
+    # 4. Get Decision
+    final_action, surfer_act, fear, vetoed = council.get_decision(state_tensor, VETO_THRESHOLD)
 
-    plt.figure(figsize=(12, 6))
+    # 5. Report
+    current_price = df['Close'].iloc[-1]
 
-    # 1. Plot Buy & Hold for reference
-    initial_price = data_values[window_size][0]
-    bh_shares = START_BAL / initial_price
-    bh_curve = [bh_shares * data_values[i][0] for i in range(window_size, len(data_values))]
-    plt.plot(bh_curve, label='Buy & Hold', color='black', linestyle='--', alpha=0.5)
-
-    # 2. Loop through Thresholds
-    for thresh in THRESHOLDS:
-        balance = START_BAL
-        shares = 0.0
-        equity_curve = []
-
-        print(f"\n⚙️ Testing Veto Threshold: {thresh}")
-
-        for step in range(window_size, len(data_values)):
-            # Observe
-            window = data_values[step - window_size : step]
-            obs = window.flatten().astype(np.float32)
-            state_tensor = torch.FloatTensor(obs).unsqueeze(0)
-
-            # Decide
-            with torch.no_grad():
-                # Ask Guardian directly to see the Value
-                _, _, guard_val = council.guardian.act(state_tensor)
-                fear = guard_val.item()
-
-                # Ask Surfer directly to see the Action
-                surf_act, _, _ = council.surfer.act(state_tensor)
-
-            # Print status every 20 days so we don't spam console
-            if step % 20 == 0:
-                print(f"Step {step}: Fear={fear:.4f} | Surfer Action={surf_act}")
-            # --- DEBUG PROBE END ---
-
-            # Decide
-            action = council.get_decision(state_tensor, veto_threshold=thresh)
-
-            # Execute
-            current_price = data_values[step][0]
-
-            # BUY
-            if action == 1:
-                if shares == 0 and balance > 0:
-                    shares = balance / current_price
-                    balance = 0.0
-
-            # SELL (Or Vetoed)
-            elif action == 2:
-                if shares > 0:
-                    balance = shares * current_price * 0.999 # Fee
-                    shares = 0.0
-
-            # Calculate Equity
-            val = balance + (shares * current_price)
-            equity_curve.append(val)
-
-        final_val = equity_curve[-1]
-        profit_pct = (final_val - START_BAL) / START_BAL * 100
-        results[thresh] = profit_pct
-
-        print(f"   🏁 Final Balance: ${final_val:.2f} ({profit_pct:+.2f}%)")
-        plt.plot(equity_curve, label=f'Thresh {thresh} ({profit_pct:.1f}%)')
-
-    # --- E. FINALIZE ---
-    plt.title(f"Council Strategy Optimization (Starting ${START_BAL})")
-    plt.xlabel("Days")
-    plt.ylabel("Portfolio Value ($)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-    best_thresh = max(results, key=results.get)
     print("\n" + "="*40)
-    print(f"🏆 WINNER: Threshold {best_thresh}")
-    print(f"   Profit: {results[best_thresh]:.2f}%")
+    print(f"   📊 MARKET REPORT: {TICKER}")
+    print(f"   Current Price: ${current_price:.2f}")
+    print("-" * 40)
+
+    print(f"   😱 Guardian Fear Level: {fear:.4f}")
+    print(f"      (Veto Threshold: {VETO_THRESHOLD})")
+
+    act_str = ["SKIP", "BUY", "SELL"]
+    print(f"   🏄 Surfer Suggestion:   {act_str[surfer_act]}")
+
+    if vetoed:
+        print("   🛡️ STATUS: VETOED (Guardian blocked the trade)")
+
+    print("-" * 40)
+    print(f"   🏆 FINAL DECISION: {act_str[final_action]}")
     print("="*40)
 
+    # 6. Trade Plan
+    if final_action == 1: # BUY
+        sl = current_price * 0.95 # -5% for ^IXIC
+        tp = current_price * 1.10 # +10%
+        print(f"   🚀 PLAN: Long Entry")
+        print(f"      Stop Loss:   ${sl:.2f}")
+        print(f"      Take Profit: ${tp:.2f}")
+    elif final_action == 2:
+        print("   🔴 PLAN: Close Positions / Stay Cash")
+
 if __name__ == "__main__":
-    run_optimization()
+    predict_council_decision()

@@ -292,7 +292,17 @@ class StockTradingEnv(gym.Env):
     def __init__(self, ticker="NVDA", window_size=10):
         super(StockTradingEnv, self).__init__()
         print(f"📥 Downloading {ticker} data...")
-        self.df = yf.download(ticker, period="5y", interval="1d", progress=False)
+        raw_df = yf.download(ticker, period="5y", interval="1d", progress=False, auto_adjust=True)
+
+        # Fix MultiIndex (yfinance update)
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            raw_df.columns = raw_df.columns.get_level_values(0)
+        split_idx = int(len(raw_df) * 0.8)
+
+        if mode == "train":
+            self.df = raw_df.iloc[:split_idx].copy()
+        else:
+            self.df = raw_df.iloc[split_idx:].copy()
 
         # Fix MultiIndex (yfinance update)
         if isinstance(self.df.columns, pd.MultiIndex):
@@ -599,16 +609,12 @@ def train_sniper():
     opt_pred = optim.Adam(predictor.parameters(), lr=0.001)
     loss_fn = nn.MSELoss()
 
-    for epoch in range(2000):
+    for epoch in range(150):
         opt_pred.zero_grad()
         loss = loss_fn(predictor(X_train), y_train)
         loss.backward()
         opt_pred.step()
         if epoch % 50 == 0: print(f"   Epoch {epoch}: Loss {loss.item():.4f}")
-
-    # Move training tensors to the same device as the agent (CPU or CUDA)
-    X_train = torch.from_numpy(np.array(X_train, dtype=np.float32)).to(device)
-    y_train = torch.from_numpy(np.array(y_train, dtype=np.float32)).unsqueeze(1).to(device)
 
     # 2. Train the Body Only
     # We use a separate optimizer to train just the feature extractor
