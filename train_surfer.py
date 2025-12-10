@@ -153,14 +153,24 @@ class KANActorCritic(nn.Module):
 # 3. TRADING ENVIRONMENT (NASDAQ EDITION)
 # ==============================================================================
 class StockTradingEnv(gym.Env):
-    def __init__(self, ticker="^IXIC", window_size=30):
+    def __init__(self, ticker="^IXIC", window_size=30, mode="train"): # Added 'mode'
         super(StockTradingEnv, self).__init__()
-        print(f"📥 Downloading {ticker} (NASDAQ) data...")
+        print(f"📥 Downloading {ticker} for {mode.upper()}...")
 
-        # Download Data
-        self.df = yf.download(ticker, period="5y", interval="1d", progress=False)
-        if isinstance(self.df.columns, pd.MultiIndex):
-            self.df.columns = self.df.columns.get_level_values(0)
+        # 1. Download ALL Data
+        raw_df = yf.download(ticker, period="5y", interval="1d", progress=False, auto_adjust=True)
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            raw_df.columns = raw_df.columns.get_level_values(0)
+
+        # 2. SPLIT DATA (Prevent Leakage)
+        split_idx = int(len(raw_df) * 0.8) # 80% Train, 20% Test
+
+        if mode == "train":
+            self.df = raw_df.iloc[:split_idx].copy() # 2019-2023
+            print(f"   📅 Training Range: {self.df.index[0].date()} -> {self.df.index[-1].date()}")
+        else:
+            self.df = raw_df.iloc[split_idx:].copy() # 2024-2025 (Unknown Future)
+            print(f"   📅 Testing Range:  {self.df.index[0].date()} -> {self.df.index[-1].date()}")
 
         # Feature Engineering
         self.df["Log_Ret"] = np.log(self.df["Close"] / self.df["Close"].shift(1))
@@ -184,7 +194,7 @@ class StockTradingEnv(gym.Env):
     def reset(self, seed=None):
         super().reset(seed=seed)
         self.current_step = self.window_size
-        self.balance = 20.0
+        self.balance = 20.0 # Standard start
         self.shares = 0
         self.entry_price = 0
         return self._get_observation(), {}
@@ -200,26 +210,24 @@ class StockTradingEnv(gym.Env):
         reward = 0
         done = False
 
-        # --- DEBUG COMMEND: Track Action Logic ---
-        # if self.current_step % 500 == 0:
-        #    print(f"DEBUG Step {self.current_step}: Action {action}, Price {current_price:.2f}, Shares {self.shares}")
-
         # --- 1. ACTION LOGIC ---
         if action == 1: # BUY
             if self.shares == 0 and self.balance > 0:
                 self.shares = self.balance / current_price
                 self.balance = 0.0
                 self.entry_price = current_price
-                reward -= 0.05
+                reward -= 0.05 # Tiny entry cost (commissions)
 
         elif action == 2: # SELL
             if self.shares > 0:
                 gross_val = self.shares * current_price
                 net_val = gross_val * 0.999
+                profit_dollars = net_val - (self.shares * self.entry_price)
                 cost_basis = self.shares * self.entry_price
-                profit_dollars = net_val - cost_basis
-                # Reward Profit %
+
+                # Reward Profit Percentage heavily
                 reward = (profit_dollars / cost_basis) * 100
+
                 self.balance = net_val
                 self.shares = 0
                 self.entry_price = 0
@@ -228,25 +236,29 @@ class StockTradingEnv(gym.Env):
         if self.shares > 0:
             current_return = (current_price - self.entry_price) / self.entry_price
 
-            # A. Stop Loss (-5%)
+            # Stop Loss (-5%)
             if current_return < -0.05:
                 gross_val = self.shares * current_price
                 self.balance = gross_val * 0.999
                 self.shares = 0
-                reward = -5.0 # Punishment
+                reward = -1.0
 
-            # B. Take Profit (+20%)
+                # Take Profit (+20%)
             elif current_return > 0.20:
                 gross_val = self.shares * current_price
                 self.balance = gross_val * 0.999
                 self.shares = 0
-                reward = +20.0 # Reward
+                reward = +20.0
 
-            # C. Compass (Stability Sauce)
+            # Compass (Daily Feedback)
             else:
-                # This logic is what makes your agent "Stable"
-                # It gets paid to hold, as long as daily return isn't terrible
                 reward += (daily_log_ret * 10) + 0.01
+
+        # --- 3. BOREDOM PENALTY (CRITICAL FIX) ---
+        else:
+            # If shares == 0, we are sitting in cash.
+            # Punish it so it doesn't play dead.
+            reward -= 0.1
 
         self.current_step += 1
         if self.current_step >= self.max_steps:
@@ -370,14 +382,22 @@ def run_training_pipeline():
 
 def run_backtest():
     TICKER = "^IXIC"
-    TEST_START, TEST_END = "2025-01-01", "2025-12-30" # Let's test on 2024 data
+
+    # --- FIX 1: USE KNOWN DATA (2024) ---
+    # We trained on 2019-2023. We test on 2024.
+    TEST_START, TEST_END = "2024-01-01", "2024-12-30"
+
     print(f"\n⚔️ BACKTEST: {TICKER} ({TEST_START} -> {TEST_END})")
 
-    # Load Data
+    # 1. Load Data
     df = yf.download(TICKER, start=TEST_START, end=TEST_END, progress=False, auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-    # Prep Features
+    if len(df) < 50:
+        print("❌ ERROR: Not enough data downloaded. Check your dates.")
+        return
+
+    # 2. Prep Features
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_Norm'] = df['Volume'] / df['Volume'].rolling(20).mean()
     df.ta.rsi(length=14, append=True)
@@ -389,12 +409,15 @@ def run_backtest():
     df["MACD_12_26_9"] = (df["MACD_12_26_9"] - df["MACD_12_26_9"].mean()) / (df["MACD_12_26_9"].std() + 1e-7)
 
     features = ["Close", "Log_Ret", "Vol_Norm", "RSI_14", "MACD_12_26_9"]
-    env = StockTradingEnv(ticker=TICKER, window_size=30)
+
+    # 3. Setup Env with TEST data
+    # IMPORTANT: We manually inject the dataframe so the mode doesn't matter here
+    env = StockTradingEnv(ticker=TICKER, window_size=30, mode="test")
     env.df = df
     env.data = df[features].values
     env.max_steps = len(env.data) - 1
 
-    # Load Agent
+    # 4. Load Agent
     agent = KANActorCritic(env.obs_shape, env.action_space.n, hidden_dim=32).to(device)
     try:
         agent.load_state_dict(torch.load("kan_agent_nasdaq.pth", map_location=device, weights_only=True))
@@ -408,20 +431,23 @@ def run_backtest():
 
     portfolio_history = []
 
+    print("   🚀 Running Simulation...")
     while not done:
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
         with torch.no_grad():
+            # ARGMAX for deterministic testing
             logits = agent.actor_head(agent.body(state_tensor))
             action = torch.argmax(logits, dim=1).item()
 
         next_state, _, done, _, _ = env.step(action)
 
-        # Calculate Value
+        # Track Value
         current_idx = env.current_step
-        if current_idx < len(env.df):
+        if current_idx < len(env.data):
             current_price = env.data[current_idx][0]
             val = env.balance + (env.shares * current_price)
             portfolio_history.append(val)
+
         state = next_state
 
     if portfolio_history:
@@ -430,12 +456,15 @@ def run_backtest():
         ret = (end_bal - start_bal) / start_bal * 100
         print(f"📊 Final Return: {ret:.2f}% (Start: ${start_bal} -> End: ${end_bal:.2f})")
         plt.plot(portfolio_history)
-        plt.title(f"NASDAQ Surfer Performance: {ret:.2f}%")
+        plt.title(f"NASDAQ Surfer Performance (2024 Test): {ret:.2f}%")
         plt.show()
+    else:
+        print("❌ Error: No trades recorded.")
+
 
 if __name__ == "__main__":
     # 1. Train on NASDAQ
-    run_training_pipeline()
-    # 2. Test
+    # run_training_pipeline()
+    # # 2. Test
 
     run_backtest()
