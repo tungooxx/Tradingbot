@@ -284,7 +284,7 @@ class TradingLogger:
         return final
 
 class StockTradingEnv(gym.Env):
-    def __init__(self, ticker="SPY", window_size=10):
+    def __init__(self, ticker="ETH-USD", window_size=30):
         super(StockTradingEnv, self).__init__()
         print(f"📥 Downloading {ticker} data...")
         self.df = yf.download(ticker, period="5y", interval="1d", progress=False)
@@ -362,55 +362,56 @@ class StockTradingEnv(gym.Env):
 
     def step(self, action):
         current_price = self.data[self.current_step][0]
-        # Get the Log Return for today (how much the market moved)
         daily_log_ret = self.data[self.current_step][1]
 
         reward = 0
         done = False
 
-        # --- 1. ACTION LOGIC ---
+        # --- 1. ACTION LOGIC (Buy/Sell) ---
         if action == 1:  # BUY
-            # Fix: Invest ALL available cash, not just $1
-            # This mimics "Going Long"
             if self.shares == 0 and self.balance > 0:
                 self.shares = self.balance / current_price
                 self.balance = 0.0
                 self.entry_price = current_price
-
-                # Penalty: Small negative reward for entering to discourage spamming
-                reward -= 0.05
+                reward -= 0.05  # Tiny penalty for entry
 
         elif action == 2:  # SELL
             if self.shares > 0:
-                # 1. Calculate Gross Value
                 gross_val = self.shares * current_price
-
-                # 2. Apply 0.1% Fee (Spread/Commissions)
                 net_val = gross_val * 0.999
-
-                # 3. Calculate Real Dollar Profit
-                # (What we have now) - (What we spent)
-                # We need to know 'cost_basis'. Since we go all-in, cost_basis was the entry value.
                 cost_basis = self.shares * self.entry_price
                 profit_dollars = net_val - cost_basis
-
-                # 4. Reward is % Return on Capital
                 reward = (profit_dollars / cost_basis) * 100
-
                 self.balance = net_val
                 self.shares = 0
                 self.entry_price = 0
 
-        # --- 2. HOLDING REWARD (FIXED) ---
-        # Only give holding reward if we actually HOLD shares
+        # --- 2. HOLDING LOGIC (Safety Checks + Compass) ---
         if self.shares > 0:
-            # If we hold, we experience the market volatility (good or bad)
-            # We add a tiny 'time cost' (-0.001) so it doesn't hold forever if flat
-            reward += (daily_log_ret * 10) - 0.001
-        else:
-            # If we are in cash, we get 0 reward.
-            # Safe, but we miss out on potential gains (Opportunity Cost).
-            reward += 0.0
+            current_return = (current_price - self.entry_price) / self.entry_price
+
+            # A. STOP LOSS (-5%)
+            if current_return < -0.05:
+                gross_val = self.shares * current_price
+                self.balance = gross_val * 0.999
+                self.shares = 0.0
+                self.entry_price = 0.0
+                reward = -5.0  # Big Punishment
+
+            # B. TAKE PROFIT (+20%)
+            elif current_return > 0.20:
+                gross_val = self.shares * current_price
+                self.balance = gross_val * 0.999
+                self.shares = 0.0
+                self.entry_price = 0.0
+                reward = +20.0  # Big Reward
+
+            # C. THE COMPASS (Daily Feedback)
+            # If we didn't hit SL or TP, tell the agent how today went.
+            else:
+                # Give it the daily return as a cookie + small holding bonus
+                # This fixes the "Sparse Reward" problem
+                reward += (daily_log_ret * 10) + 0.01
 
         self.current_step += 1
         if self.current_step >= self.max_steps:
@@ -443,7 +444,7 @@ def prepare_pretraining_data(env):
 
 def run_pipeline():
     # 1. Init Env
-    env = StockTradingEnv(ticker='SPY', window_size=10)
+    env = StockTradingEnv(ticker='ETH-USD', window_size=30)
     obs_dim = env.obs_shape
     action_dim = env.action_space.n
     hidden_dim = 32 # Keep small for speed
@@ -460,7 +461,7 @@ def run_pipeline():
 
     # Init Predictor
     predictor = KANPredictor(obs_dim, hidden_dim)
-    optimizer_pred = optim.Adam(predictor.parameters(), lr=0.001)
+    optimizer_pred = optim.Adam(predictor.parameters(), lr=0.0001)
     criterion = nn.MSELoss()
 
     # Train Loop
@@ -497,7 +498,7 @@ def run_pipeline():
     episode_reward = 0
     memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
 
-    for step in range(1, 10000):
+    for step in range(1, 20000):
         # -- Action --
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
         action, log_prob, _ = agent.act(state_tensor)
@@ -587,14 +588,14 @@ def run_pipeline():
             # Reset for next episode
             state, _ = env.reset()
             episode_reward = 0
-            torch.save(agent.state_dict(), "kan_agent.pth")
+            torch.save(agent.state_dict(), "kan_agent_crypto.pth")
             logger = TradingLogger() # CRITICAL: Reset logger to avoid ghost inventory
 def run_backtest():
     # 1. SETUP: Define Split Dates
-    TICKER = "SPY"
+    TICKER = "ETH-USD"
     # We test on data the model (hopefully) hasn't seen
-    TEST_START  = "2024-01-01"
-    TEST_END    = "2025-12-01" # Or current date
+    TEST_START  = "2025-01-01"
+    TEST_END    = "2025-12-08" # Or current date
 
     print(f"⚔️ REALITY CHECK: Backtesting {TICKER}")
     print(f"   Testing Period:  {TEST_START} -> {TEST_END}")
@@ -726,6 +727,5 @@ def run_backtest():
 
 
 if __name__ == "__main__":
-    # run_pipeline()
-    for i in range(10):
-        run_backtest()
+    run_pipeline()
+    run_backtest()
