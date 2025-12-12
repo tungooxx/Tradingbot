@@ -24,7 +24,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 Device: {device}")
 
-WINDOW_SIZE = 30
+WINDOW_SIZE = 31
 SINGLE_STEP_FEATURE_DIM = 8
 GAMMA = 0.99
 BETA_KLD = 0.001
@@ -49,9 +49,10 @@ TICKERS = [
 
 # Define Agent Profiles
 TEAM_PROFILES = {
-    "Aggressive": {"risk_aversion": 0.01, "reward_multiplier": 2.0},
-    "Conservative": {"risk_aversion": 0.5, "reward_multiplier": 1.0},
-    "Standard": {"risk_aversion": 0.1, "reward_multiplier": 1.2},
+    "Aggressive":      {"risk_aversion": 0.01, "reward_multiplier": 2.0},
+    "Conservative":    {"risk_aversion": 0.5,  "reward_multiplier": 1.0},
+    "Standard":        {"risk_aversion": 0.1,  "reward_multiplier": 1.2},
+    "ShortSpecialist": {"risk_aversion": 0.05, "reward_multiplier": 1.5},
 }
 NUM_EXPERTS = len(TEAM_PROFILES)
 EXPERT_NAMES = list(TEAM_PROFILES.keys())
@@ -124,126 +125,131 @@ class VariationalAutoencoder(nn.Module):
 
 
 class FeatureExtractor(nn.Module):
-    """
-    Replaces the VAE. Uses 1D Convolutions to extract trend and volatility features
-    from the 30-day window.
-    """
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.cnn = nn.Sequential(
-            # Layer 1: Detect local patterns (3-day moves)
-            # Input: (Batch, Features, Window) -> (Batch, 8, 30)
             nn.Conv1d(in_channels=input_dim, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-
-            # Layer 2: Detect medium patterns
+            nn.BatchNorm1d(32), nn.GELU(),
             nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-
-            # Layer 3: Compress to a single feature vector per time step
+            nn.BatchNorm1d(64), nn.GELU(),
             nn.Conv1d(in_channels=64, out_channels=hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
         )
-        # We also need a way to summarize the WHOLE window for the Gate
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, x):
-        # x shape: (Batch, Window, Features) -> Permute to (Batch, Features, Window)
-        x = x.permute(0, 2, 1)
-
-        # Extract features: (Batch, Hidden_Dim, Window)
+        x = x.permute(0, 2, 1) # (B, F, W)
         features = self.cnn(x)
-
-        # Global Context for Gating: (Batch, Hidden_Dim)
         global_context = self.global_pool(features).squeeze(-1)
-
-        # Permute features back for GRU: (Batch, Window, Hidden_Dim)
-        features = features.permute(0, 2, 1)
-
-        return features, global_context
+        return features.permute(0, 2, 1), global_context
 
 class ResearchAgentBody(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # The Feature Extractor (CNN)
         self.feature_extractor = FeatureExtractor(input_dim, hidden_dim)
-
-        # The Sequence Processor (GRU)
-        # Input is now hidden_dim (from CNN) + input_dim (raw price) to preserve signal
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
-
     def forward(self, x):
-        # 1. Extract Features (CNN)
-        cnn_features, global_context = self.feature_extractor(x)
-
-        # 2. Process Sequence (GRU)
-        # We feed the CNN features into the GRU to analyze temporal order
-        gru_out, _ = self.gru(cnn_features)
-
-        # Use the last hidden state as the final decision vector
-        final_state = gru_out[:, -1, :]
-
-        return final_state, global_context
+        cnn_feats, context = self.feature_extractor(x)
+        gru_out, _ = self.gru(cnn_feats)
+        return gru_out[:, -1, :], context
 
 class KANActorCritic(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=64):
         super().__init__()
-        self.num_experts = NUM_EXPERTS
-
-        # New Hybrid Body
         self.body = ResearchAgentBody(SINGLE_STEP_FEATURE_DIM, hidden_dim)
-
-        # Experts
-        self.expert_critics = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(self.num_experts)])
-        self.expert_actors = nn.ModuleList([nn.Linear(hidden_dim, action_dim) for _ in range(self.num_experts)])
-
-        # 🟢 FIX: Gate uses the CNN's "Global Context"
-        self.gate_network = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, self.num_experts)
-        )
+        self.expert_critics = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(NUM_EXPERTS)])
+        self.expert_actors = nn.ModuleList([nn.Linear(hidden_dim, action_dim) for _ in range(NUM_EXPERTS)])
+        self.gate_network = nn.Sequential(nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, NUM_EXPERTS))
 
     def forward(self, x):
-        # 1. Get Body Output & Context
-        # body_out: The decision vector from GRU
-        # context: The global regime vector from CNN (used for Gating)
         body_out, context = self.body(x)
-
-        # 2. Gating (Decide who is in charge based on Context)
         gate_weights = F.softmax(self.gate_network(context), dim=1)
-
-        # 3. MoE Weighted Sum
-        weighted_logits = sum(gate_weights[:, i:i+1] * self.expert_actors[i](body_out) for i in range(self.num_experts))
-        weighted_value = sum(gate_weights[:, i:i+1] * self.expert_critics[i](body_out) for i in range(self.num_experts))
-
-        return weighted_logits, weighted_value.squeeze(1), gate_weights
+        logits = sum(gate_weights[:, i:i+1] * self.expert_actors[i](body_out) for i in range(NUM_EXPERTS))
+        value = sum(gate_weights[:, i:i+1] * self.expert_critics[i](body_out) for i in range(NUM_EXPERTS))
+        return logits, value.squeeze(1), gate_weights
 
     def evaluate(self, x):
         body_out, context = self.body(x)
         gate_weights = F.softmax(self.gate_network(context), dim=1)
-
-        weighted_logits = sum(gate_weights[:, i:i+1] * self.expert_actors[i](body_out) for i in range(self.num_experts))
-        weighted_value = sum(gate_weights[:, i:i+1] * self.expert_critics[i](body_out) for i in range(self.num_experts))
-
-        dist = Categorical(logits=weighted_logits)
-        # Note: We return None for VAE outputs since we removed the VAE
-        return dist.log_prob, weighted_value.squeeze(1), dist.entropy(), gate_weights, None, None, None
+        logits = sum(gate_weights[:, i:i+1] * self.expert_actors[i](body_out) for i in range(NUM_EXPERTS))
+        value = sum(gate_weights[:, i:i+1] * self.expert_critics[i](body_out) for i in range(NUM_EXPERTS))
+        dist = Categorical(logits=logits)
+        return dist.log_prob, value.squeeze(1), dist.entropy(), gate_weights, None, None, None
 
     def act(self, x, deterministic=False):
         logits, _, gate_weights = self.forward(x)
         if deterministic:
-            action = torch.argmax(logits, dim=1)
-            # 🛑 FIX: Return integer directly
-            return action.item(), None, gate_weights
-        else:
-            dist = Categorical(logits=logits)
-            action = dist.sample()
-            return action.item(), dist.log_prob(action), gate_weights
+            return torch.argmax(logits, dim=1).item(), None, gate_weights
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        return action.item(), dist.log_prob(action), gate_weights
+
+# ==============================================================================
+# 2. PRODUCTION ENVIRONMENT (Short-Selling & Rebalancing)
+# ==============================================================================
+class MultiStockEnv(gym.Env):
+    def __init__(self, data_map, window_size, is_validation=False):
+        super().__init__()
+        self.data_map, self.tickers, self.window_size, self.is_validation = data_map, list(data_map.keys()), window_size, is_validation
+        self.action_space = spaces.Discrete(3)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(window_size, 8), dtype=np.float32)
+        self.position, self.portfolio_history, self.max_equity, self.lambda_penalty = 0.0, [10000.0], 10000.0, 1.0
+
+    def reset(self, seed=None):
+        self.current_ticker = random.choice(self.tickers)
+        self.features, self.prices = self.data_map[self.current_ticker]['features'], self.data_map[self.current_ticker]['prices']
+        self.max_step = len(self.prices) - 1
+        self.current_step = random.randint(self.window_size, max(self.window_size+1, self.max_step-50))
+        self.position, self.portfolio_history, self.max_equity = 0.0, [10000.0], 10000.0
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        obs = self.features[max(0, self.current_step - self.window_size) : self.current_step]
+        if len(obs) < self.window_size:
+            pad = np.zeros((self.window_size - len(obs), SINGLE_STEP_FEATURE_DIM))
+            obs = np.vstack([pad, obs])
+        return obs.astype(np.float32)
+
+    def step(self, action, expert_profile=None):
+        current_price = self.prices[self.current_step]
+        self.current_step += 1
+        if self.current_step >= len(self.prices): return self._get_obs(), 0.0, True, False, {}
+
+        next_price = self.prices[self.current_step]
+        fee, borrow_fee = 0.0005, 0.0001
+        prev_val = self.portfolio_history[-1]
+
+        # Rebalancing
+        target_pos = 0.0
+        if action == 1: target_pos = 1.0
+        elif action == 2: target_pos = -1.0
+
+        current_equity = prev_val
+        if target_pos != self.position:
+            current_equity *= (1 - fee)
+            self.position = target_pos
+
+        # Returns
+        price_return = (next_price - current_price) / (current_price + 1e-8)
+        step_return = self.position * price_return
+        if self.position < 0: step_return -= borrow_fee
+
+        new_val = max(10.0, current_equity * (1 + step_return))
+        done = self.current_step >= self.max_step or new_val <= 10.0
+
+        # Reward
+        self.max_equity = max(self.max_equity, new_val)
+        drawdown = (self.max_equity - new_val) / (self.max_equity + 1e-8)
+        reward = math.log(np.clip(new_val / (prev_val + 1e-8), 0.5, 2.0)) - (0.2 * drawdown * self.lambda_penalty)
+        if self.position < 0 and price_return < -0.01: reward += 0.001 # Short bonus
+        if self.position == 0: reward -= 0.0001 # Inflation
+
+        if expert_profile:
+            reward *= expert_profile['reward_multiplier']
+            if expert_profile['risk_aversion'] > 0.3: reward -= (drawdown * 1.5 * self.lambda_penalty)
+
+        self.portfolio_history.append(new_val)
+        return self._get_obs(), float(reward), done, False, {}
 
 
 # ==============================================================================
@@ -302,50 +308,33 @@ class MultiStockEnv(gym.Env):
         self.tickers = list(data_map.keys())
         self.window_size = window_size
         self.is_validation = is_validation
-
         self.action_space = spaces.Discrete(3)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(window_size, 8), dtype=np.float32)
 
-        self.current_ticker = None
-        self._load_random_stock()
+        # Standard Production Defaults
+        self.initial_balance = 10000.0
+        self.position = 0.0
+        self.max_equity = 10000.0
+        self.portfolio_history = [10000.0]
 
-    def _load_random_stock(self):
+    def reset(self, seed=None):
         self.current_ticker = random.choice(self.tickers)
         self.features = self.data_map[self.current_ticker]['features']
         self.prices = self.data_map[self.current_ticker]['prices']
         self.max_step = len(self.prices) - 1
 
-    def reset(self, seed=None):
-        self._load_random_stock()
+        # Guard for short windows
+        lower_bound = self.window_size
+        upper_bound = max(lower_bound + 1, self.max_step - 50)
+        self.current_step = random.randint(lower_bound, upper_bound) if upper_bound > lower_bound else lower_bound
 
-        # 🛑 FIX: Dynamically calculate bounds based on actual data size
-        self.max_step = len(self.prices) - 1
-
-        # Minimum data required for 1 step is WINDOW_SIZE + 1
-        # If we have less, we force the start to a safe index to prevent IndexError
-        if self.max_step <= self.window_size:
-            self.current_step = self.window_size
-        else:
-            # We want to start at least at window_size
-            # and leave at least 1 step possible (max_step)
-            lower_bound = self.window_size
-            upper_bound = self.max_step - 1 # Leave at least 1 day to trade
-
-            if upper_bound > lower_bound:
-                # Random start for training
-                self.current_step = random.randint(lower_bound, upper_bound)
-            else:
-                self.current_step = lower_bound
-
-        self.balance = 10000.0
-        self.shares = 0
-        self.buy_price = 0.0
+        # Reset State
         self.initial_balance = 10000.0
+        self.position = 0.0
         self.max_equity = 10000.0
-        self.portfolio_history = [self.initial_balance]
-        self.lambda_penalty = 1.0
+        self.portfolio_history = [10000.0]
 
-        return self.features[self.current_step - self.window_size: self.current_step], {}
+        return self.features[self.current_step - self.window_size : self.current_step], {}
 
     def step(self, action, expert_profile=None):
         current_price = self.prices[self.current_step]
@@ -353,52 +342,67 @@ class MultiStockEnv(gym.Env):
         next_price = self.prices[self.current_step]
         done = self.current_step >= self.max_step
 
-        # Lower cost to prevent paralysis
-        cost = 0.0005
+        fee = 0.0005
+        short_borrow_fee = 0.0001
+        prev_portfolio_val = self.portfolio_history[-1]
 
-        if action == 1 and self.shares == 0: # Buy
-            self.shares = self.balance / current_price
-            self.balance = 0.0
-            self.buy_price = current_price
-            # reward -= cost # (Optional: remove immediate penalty to encourage entry)
-        elif action == 2 and self.shares > 0: # Sell
-            self.balance = self.shares * current_price * (1 - cost)
-            self.shares = 0
-            self.buy_price = 0.0
+        # 1. Rebalancing Logic
+        target_position = 0.0
+        if action == 1: target_position = 1.0
+        elif action == 2: target_position = -1.0
 
-        # --- 🟢 NEW REWARD LOGIC (Log-Utility) ---
-        prev_val = self.portfolio_history[-1]
-        current_val = self.balance + (self.shares * next_price)
-        self.portfolio_history.append(current_val)
+        current_equity = prev_portfolio_val
+        if target_position != self.position:
+            current_equity *= (1 - fee)
+            self.position = target_position
 
-        # Update High Water Mark
-        self.max_equity = max(self.max_equity, current_val)
-        drawdown = (self.max_equity - current_val) / self.max_equity
+        # 2. Market Physics (Return-Based)
+        # Price return can be positive or negative
+        price_return = (next_price - current_price) / (current_price + 1e-8)
 
-        if current_val <= 0:
-            reward = -10.0 # Bust penalty
+        # If position is -1 (Short), a negative price_return becomes a positive gain
+        step_return = self.position * price_return
+
+        if self.position < 0:
+            step_return -= short_borrow_fee
+
+        new_portfolio_val = current_equity * (1 + step_return)
+
+        # 3. Guardrails
+        if new_portfolio_val < 10.0:
+            new_portfolio_val = 10.0
+            done = True
+
+        # 4. Reward (Log-Utility + Drawdown Penalty)
+        self.max_equity = max(self.max_equity, new_portfolio_val)
+        drawdown = (self.max_equity - new_portfolio_val) / (self.max_equity + 1e-8)
+
+        # 2. Log-Utility Reward (The main profit driver)
+        # Stability clip for the log ratio
+        safe_ratio = np.clip(new_portfolio_val / (prev_portfolio_val + 1e-8), 0.5, 2.0)
+        reward = math.log(safe_ratio)
+
+        # 3. Symmetric Risk/Drawdown Penalties (The FIX)
+        # Uniform penalty for active trading (long or short) to encourage smart risk-taking.
+        penalty_weight = 0.2
+        cash_penalty = 0.0001 # Small penalty to discourage 'laziness'
+
+        if self.position != 0:
+            # Apply Drawdown penalty only for active positions (Long or Short)
+            reward -= (penalty_weight * drawdown)
         else:
-            # Log Return (Geometric Growth)
-            log_ret = math.log(current_val / prev_val)
+            # Small penalty for sitting in cash
+            reward -= cash_penalty
 
-            # Drawdown Penalty (Dynamic Risk Aversion)
-            penalty_weight = 0.1 # Lower = More Aggressive
-            dd_penalty = penalty_weight * drawdown
+        # 4. Expert Profile Adjustment (Your original code for experts)
+        if expert_profile:
+            reward *= expert_profile['reward_multiplier']
+            if expert_profile['risk_aversion'] > 0.3: # Conservative Expert
+                # Conservative expert gets an extra 1.5x penalty on drawdown
+                reward -= (drawdown * 1.5)
 
-            reward = log_ret - dd_penalty
-
-            # Expert Adjustments
-            if expert_profile:
-                if expert_profile['risk_aversion'] > 0.3: # Conservative
-                    reward -= drawdown * 2.0 # Extra pain for drawdown
-                reward *= expert_profile['reward_multiplier']
-
-        if done and not self.is_validation:
-            self._load_random_stock()
-            self.current_step = self.window_size
-
-        return self.features[self.current_step - self.window_size : self.current_step], reward, done, False, {}
-
+        self.portfolio_history.append(new_portfolio_val)
+        return self.features[self.current_step - self.window_size : self.current_step], float(reward), done, False, {}
 
 # ==============================================================================
 # 4. TRAINING LOOP (MULTI-STOCK)
@@ -483,6 +487,7 @@ def train_multi_stock(agent, train_env, val_env, optimizer, episodes=300, steps_
 
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=0.5)
                 optimizer.step()
 
                 loss_val = loss.item()
@@ -491,27 +496,24 @@ def train_multi_stock(agent, train_env, val_env, optimizer, episodes=300, steps_
         if episode % 5 == 0:
             agent.eval()
             total_val_return = 0
-            # Test on 3 random stocks from Val set
             for _ in range(3):
+                # 🟢 Reset MUST happen first to create the 'balance' attribute
                 val_obs, _ = val_env.reset()
                 val_done = False
-                val_bal = 10000.0
-                val_shares = 0
 
-                # Run for 200 steps or until done
-                for _ in range(200):
+                while not val_done:
                     state_t = torch.tensor(val_obs, dtype=torch.float32).unsqueeze(0).to(device)
                     with torch.no_grad():
                         action, _, _ = agent.act(state_t, deterministic=True)
 
                     val_obs, _, val_done, _, _ = val_env.step(action)
-                    if val_done: break
 
-                    # Track dummy pnl for scoring
-                    price = val_env.prices[val_env.current_step]
-                    curr_val = val_env.balance + (val_env.shares * price)
+                    # This now works because balance was created in reset()
+                    price = val_env.prices[val_env.current_step-1]
+                    # Note: portfolio_history[-1] is the most reliable way to get value
+                    curr_val = val_env.portfolio_history[-1]
 
-                final_val = val_env.balance + (val_env.shares * val_env.prices[val_env.current_step])
+                final_val = val_env.portfolio_history[-1]
                 total_val_return += ((final_val - 10000.0) / 10000.0) * 100
 
             avg_val_return = total_val_return / 3
@@ -655,8 +657,10 @@ def finetune_and_backtest_asset(ticker, start_date, fine_tune_date, backtest_dat
         obs, _, done, _, _ = bt_env.step(action_int)
         actions.append(action_int)
 
-    final_val = bt_env.balance + (bt_env.shares * bt_env.prices[bt_env.current_step-1])
-    ret = ((final_val - bt_env.initial_balance) / bt_env.initial_balance) * 100
+    initial_val = bt_env.portfolio_history[0]
+    final_val = bt_env.portfolio_history[-1]
+
+    ret = ((final_val - initial_val) / initial_val) * 100
     bh = ((bt_env.prices[-1] - bt_env.prices[0]) / bt_env.prices[0]) * 100
 
     print(f"\n📊 RESULTS: AI {ret:.2f}% vs Buy&Hold {bh:.2f}%")
@@ -668,188 +672,137 @@ def finetune_and_backtest_asset(ticker, start_date, fine_tune_date, backtest_dat
         print("   ❌ UNDERPERFORMED")
 
 # Global Hyperparameters for Robustness
-ENTROPY_BETA = 0.001  # Lowered to allow more conviction
-VALIDATION_DAYS = 30  # Shorter OOS window for more relevance
-TOURNAMENT_EPOCHS = 50
+
+ENTROPY_BETA = 0.005
+VALIDATION_DAYS = 60  # 🛑 Fixed at 60 to prevent IndexError and ensure statistical significance
+TOURNAMENT_EPOCHS = 40
 
 def finetune_with_auto_selection(ticker, start_date, fine_tune_date, backtest_date):
-    print(f"\n\n⚔️ PROTOCOL: Robust Tournament -> Test for {ticker}")
-    print(f"   Train Window: {fine_tune_date} -> (Backtest - {VALIDATION_DAYS} days)")
-    print(f"   OOS Val Window: (Backtest - {VALIDATION_DAYS} days) -> {backtest_date}")
-
-    # 1. Download Data
+    print(f"\n\n⚔️ PROTOCOL: Robust Tournament -> {ticker}")
     full_data = download_multi_stock([ticker], start_date=start_date)
     if not full_data: return
     data = full_data[ticker]
     dates, features, prices = data['dates'], data['features'], data['prices']
 
-    # 2. Split Fine-Tune Data into Train and OOS Validation
-    ft_end_dt = pd.to_datetime(backtest_date)
     ft_start_dt = pd.to_datetime(fine_tune_date)
+    ft_end_dt = pd.to_datetime(backtest_date)
     val_split_dt = ft_end_dt - pd.Timedelta(days=VALIDATION_DAYS)
-    backtest_start_dt = pd.to_datetime(backtest_date)
 
-    mask_train = (dates >= ft_start_dt) & (dates < val_split_dt)
-    mask_val = (dates >= val_split_dt) & (dates < ft_end_dt)
-    mask_bt = (dates >= backtest_start_dt)
+    m_train = (dates >= ft_start_dt) & (dates < val_split_dt)
+    m_val = (dates >= val_split_dt) & (dates < ft_end_dt)
+    m_bt = (dates >= ft_end_dt)
 
-    # 🟢 DEFINING MAPS (Ensures no NameError)
-    train_map = {ticker: {'features': features[mask_train], 'prices': prices[mask_train]}}
-    val_map = {ticker: {'features': features[mask_val], 'prices': prices[mask_val]}}
-    bt_map = {ticker: {'features': features[mask_bt], 'prices': prices[mask_bt]}}
+    train_map = {ticker: {'features': features[m_train], 'prices': prices[m_train]}}
+    val_map = {ticker: {'features': features[m_val], 'prices': prices[m_val]}}
+    bt_map = {ticker: {'features': features[m_bt], 'prices': prices[m_bt]}}
 
-    if np.sum(mask_train) < 100 or np.sum(mask_val) < 10:
-        return print(f"❌ Data Error: Split resulted in too few samples for {ticker}")
+    best_oos_score, best_model_state, best_expert_name = -999.0, None, None
 
-    # 3. Tournament of Experts
-    candidates = ["Aggressive", "Conservative"]
-    best_oos_score = -999.0
-    best_model_state = None
-    best_expert_name = None
-
-    for expert_name in candidates:
-        print(f"\n🥊 Training {expert_name} Candidate...")
-
-        # Load Fresh Generalist
+    # Test Aggressive vs Conservative vs ShortSpecialist
+    for exp_name in ["Aggressive", "Conservative", "ShortSpecialist"]:
+        print(f"🥊 Training {exp_name} Candidate...")
         agent = KANActorCritic((WINDOW_SIZE, SINGLE_STEP_FEATURE_DIM), 3, hidden_dim=64).to(device)
-        agent.load_state_dict(torch.load("refactored_moe_agent.pth", map_location=device, weights_only=True))
+        try:
+            agent.load_state_dict(torch.load("refactored_moe_agent.pth", map_location=device, weights_only=True))
+        except: pass
 
-        target_idx = EXPERT_NAMES.index(expert_name)
-        target_profile = TEAM_PROFILES[expert_name]
-
-        # Freeze/Unfreeze
+        idx = EXPERT_NAMES.index(exp_name)
         for p in agent.parameters(): p.requires_grad = False
         for p in agent.body.parameters(): p.requires_grad = True
-        for p in agent.expert_actors[target_idx].parameters(): p.requires_grad = True
-        for p in agent.expert_critics[target_idx].parameters(): p.requires_grad = True
+        for p in agent.expert_actors[idx].parameters(): p.requires_grad = True
+        for p in agent.expert_critics[idx].parameters(): p.requires_grad = True
 
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, agent.parameters()), lr=5e-6)
-
-        # 🟢 Create Training Env
-        train_env = MultiStockEnv(train_map, WINDOW_SIZE, is_validation=False)
-        # 🟢 LOWER PENALTY during training to encourage exploration
-        train_env.lambda_penalty = 0.3
+        env = MultiStockEnv(train_map, WINDOW_SIZE); env.lambda_penalty = 0.3 # 🟢 Lower penalty during schooling
 
         agent.train()
-        for epoch in range(40):
-            obs, _ = train_env.reset()
+        for _ in range(40):
+            obs, _ = env.reset()
             for _ in range(50):
-                state_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+                st = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+                body_out, _ = agent.body(st)
+                dist = Categorical(logits=agent.expert_actors[idx](body_out))
+                act = dist.sample(); lp = dist.log_prob(act)
+                n_obs, r, d, _, _ = env.step(act.item(), TEAM_PROFILES[exp_name])
+                val = agent.expert_critics[idx](body_out)
 
-                body_out, _ = agent.body(state_t)
-                logits = agent.expert_actors[target_idx](body_out)
-                dist = Categorical(logits=logits)
+                loss = -(lp * (r - val.detach())).mean() + 0.5 * F.mse_loss(val.view(-1), torch.tensor([r], device=device).view(-1))
+                optimizer.zero_grad(); loss.backward(); optimizer.step(); obs = n_obs
+                if d: break
 
-                action_int = dist.sample().item()
-                log_prob = dist.log_prob(torch.tensor(action_int).to(device))
+        # OOS Validation
+        v_env = MultiStockEnv(val_map, WINDOW_SIZE, is_validation=True)
+        agent.eval(); obs, _ = v_env.reset(); v_done = False
+        while not v_done:
+            st = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad(): a, _, _ = agent.act(st, deterministic=True)
+            obs, _, v_done, _, _ = v_env.step(a)
 
-                next_obs, reward, done, _, _ = train_env.step(action_int, target_profile)
+        oos_ret = (v_env.portfolio_history[-1] - 10000)/10000
+        print(f"   🎯 {exp_name} OOS Result: {oos_ret*100:.2f}%")
+        if oos_ret > best_oos_score:
+            best_oos_score, best_expert_name, best_model_state = oos_ret, exp_name, agent.state_dict()
 
-                val = agent.expert_critics[target_idx](body_out)
-                adv = torch.tensor([reward], device=device) - val.squeeze()
-
-                policy_loss = -(log_prob * adv.detach()).mean()
-                # 🟢 FIXED Broadcasting: view(-1) ensures both input and target are [1]
-                value_loss = F.mse_loss(val.view(-1), torch.tensor([reward], device=device).view(-1))
-                entropy_loss = dist.entropy().mean()
-
-                loss = policy_loss + 0.5 * value_loss - ENTROPY_BETA * entropy_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                obs = next_obs
-                if done: break
-
-        # --- 4. OOS VALIDATION SCORING ---
-        val_env = MultiStockEnv(val_map, WINDOW_SIZE, is_validation=True)
-        agent.eval()
-        obs, _ = val_env.reset()
-        val_done = False
-        while not val_done:
-            state_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-            with torch.no_grad():
-                action, _, _ = agent.act(state_t, deterministic=True)
-            obs, _, val_done, _, _ = val_env.step(action)
-
-        oos_return = (val_env.portfolio_history[-1] - 10000) / 10000
-        print(f"   🎯 {expert_name} OOS Return (Last 30 Days of 2024): {oos_return*100:.2f}%")
-
-        if oos_return > best_oos_score:
-            best_oos_score = oos_return
-            best_expert_name = expert_name
-            best_model_state = agent.state_dict()
-
-    # --- 5. FINAL TEST ---
-    print(f"\n🏆 WINNER: {best_expert_name} | Running on 2025 Data...")
-    final_agent = KANActorCritic((WINDOW_SIZE, SINGLE_STEP_FEATURE_DIM), 3, hidden_dim=64).to(device)
-    final_agent.load_state_dict(best_model_state)
-    final_agent.eval()
-
+    # Final Backtest
+    print(f"\n🏆 WINNER: {best_expert_name} | Backtesting on 2025...")
+    f_agent = KANActorCritic((WINDOW_SIZE, SINGLE_STEP_FEATURE_DIM), 3, hidden_dim=64).to(device)
+    f_agent.load_state_dict(best_model_state); f_agent.eval()
     bt_env = MultiStockEnv(bt_map, WINDOW_SIZE, is_validation=True)
-    obs, _ = bt_env.reset()
-    bt_done = False
-    actions = []
+    obs, _ = bt_env.reset(); bt_done, acts = False, []
     while not bt_done:
-        state_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-        with torch.no_grad():
-            action, _, _ = final_agent.act(state_t, deterministic=True)
-        obs, _, bt_done, _, _ = bt_env.step(action)
-        actions.append(action)
+        st = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad(): a, _, _ = f_agent.act(st, deterministic=True)
+        obs, _, bt_done, _, _ = bt_env.step(a); acts.append(a)
 
-    final_val = bt_env.portfolio_history[-1]
-    ret = ((final_val - 10000) / 10000) * 100
-    bh = ((prices[mask_bt][-1] - prices[mask_bt][0]) / prices[mask_bt][0]) * 100
+    final_ret = (bt_env.portfolio_history[-1] - 10000)/100
+    bh_ret = (prices[m_bt][-1] - prices[m_bt][0]) / prices[m_bt][0] * 100
 
-    print("-" * 30)
-    print(f"📊 PRODUCT PERFORMANCE: {ret:.2f}% (B&H: {bh:.2f}%)")
-    print(f"   🧐 Strategy: {best_expert_name} | Buys: {actions.count(1)} | Sells: {actions.count(2)}")
-    print("-" * 30)
+    print("-" * 40 + f"\n📊 LIVE PERFORMANCE: {final_ret:.2f}% (B&H: {bh_ret:.2f}%)\n   🧐 Strategy: {best_expert_name} | Buys: {acts.count(1)} | Shorts: {acts.count(2)}\n" + "-" * 40)
 
 # Example call to run the protocol (outside the function
 if __name__ == "__main__":
-    # full_data = download_multi_stock(TICKERS)
-    #
-    # # 2. Split into Train (2015-2023) and Val (2024+)
-    # train_map = {}
-    # val_map = {}
-    #
-    # split_date = "2024-01-01"
-    #
-    # for ticker, data in full_data.items():
-    #     dates = data['dates']
-    #     feats = data['features']
-    #     prices = data['prices']
-    #
-    #     # Boolean Mask
-    #     mask_train = dates < split_date
-    #     mask_val = dates >= split_date
-    #
-    #     # Only add if enough data
-    #     if np.sum(mask_train) > 200:
-    #         train_map[ticker] = {
-    #             'features': feats[mask_train],
-    #             'prices': prices[mask_train]
-    #         }
-    #
-    #     if np.sum(mask_val) > 50:
-    #         val_map[ticker] = {
-    #             'features': feats[mask_val],
-    #             'prices': prices[mask_val]
-    #         }
-    #
-    # print(f"   📊 Train Universe: {len(train_map)} stocks")
-    # print(f"   📊 Val Universe:   {len(val_map)} stocks")
-    #
-    # # 3. Setup
-    # train_env = MultiStockEnv(train_map, WINDOW_SIZE, is_validation=False)
-    # val_env = MultiStockEnv(val_map, WINDOW_SIZE, is_validation=True)
-    #
-    # agent = KANActorCritic((WINDOW_SIZE, SINGLE_STEP_FEATURE_DIM), 3, hidden_dim=64).to(device)
-    # optimizer = optim.AdamW(agent.parameters(), lr=5e-5)
-    #
-    # # 4. Train
-    # train_multi_stock(agent, train_env, val_env, optimizer)
+    full_data = download_multi_stock(TICKERS)
+
+    # 2. Split into Train (2015-2023) and Val (2024+)
+    train_map = {}
+    val_map = {}
+
+    split_date = "2024-01-01"
+
+    for ticker, data in full_data.items():
+        dates = data['dates']
+        feats = data['features']
+        prices = data['prices']
+
+        # Boolean Mask
+        mask_train = dates < split_date
+        mask_val = dates >= split_date
+
+        # Only add if enough data
+        if np.sum(mask_train) > 200:
+            train_map[ticker] = {
+                'features': feats[mask_train],
+                'prices': prices[mask_train]
+            }
+
+        if np.sum(mask_val) > 50:
+            val_map[ticker] = {
+                'features': feats[mask_val],
+                'prices': prices[mask_val]
+            }
+
+    print(f"   📊 Train Universe: {len(train_map)} stocks")
+    print(f"   📊 Val Universe:   {len(val_map)} stocks")
+
+    # 3. Setup
+    train_env = MultiStockEnv(train_map, WINDOW_SIZE, is_validation=False)
+    val_env = MultiStockEnv(val_map, WINDOW_SIZE, is_validation=True)
+
+    agent = KANActorCritic((WINDOW_SIZE, SINGLE_STEP_FEATURE_DIM), 3, hidden_dim=64).to(device)
+    optimizer = optim.AdamW(agent.parameters(), lr=5e-5)
+
+    # 4. Train
+    train_multi_stock(agent, train_env, val_env, optimizer)
     # finetune_and_backtest_asset(
     #     ticker="TSLA",
     #     start_date="2023-01-01",
@@ -868,5 +821,20 @@ if __name__ == "__main__":
     #     fine_tune_date="2024-01-01",
     #     backtest_date="2025-01-01"
     # )
+    # Test individual high-momentum stock
+    finetune_with_auto_selection("LTC-USD", "2023-01-01", "2024-01-01", "2025-01-01")
+    finetune_with_auto_selection("DOGE-USD", "2023-01-01", "2024-01-01", "2025-01-01")
+    finetune_with_auto_selection("ETH-USD", "2023-01-01", "2024-01-01", "2025-01-01")
+    finetune_with_auto_selection("SOL-USD", "2023-01-01", "2024-01-01", "2025-01-01") # Added: High-Beta Crypto
+
+    # 2. Tech/Momentum Stocks
+    finetune_with_auto_selection("NVDA", "2023-01-01", "2024-01-01", "2025-01-01")
     finetune_with_auto_selection("TSLA", "2023-01-01", "2024-01-01", "2025-01-01")
-    finetune_with_auto_selection("TGT",  "2023-01-01", "2024-01-01", "2025-01-01")
+    finetune_with_auto_selection("GOOGL", "2023-01-01", "2024-01-01", "2025-01-01") # Added: Large-Cap Tech
+
+    # 3. Defensive/Value Stocks & Cyclicals
+    finetune_with_auto_selection("JNJ", "2023-01-01", "2024-01-01", "2025-01-01") # Added: Defensive Healthcare
+    finetune_with_auto_selection("TGT", "2023-01-01", "2024-01-01", "2025-01-01") # Cyclical Retail
+
+    # 4. Market Index
+    finetune_with_auto_selection("SPY", "2023-01-01", "2024-01-01", "2025-01-01") # Added: S&P 500 ETF
