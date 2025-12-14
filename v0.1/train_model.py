@@ -31,21 +31,23 @@ print(f"Using device: {device}")
 
 
 def prepare_pretraining_data(env):
-    """Extract windows (X) and next day Log Returns (y) from environment data"""
+    """Extract windows (X) and next day Log Returns (y) from environment data
+    Includes human strategy features if enabled"""
     X_list = []
     y_list = []
 
     for i in range(env.window_size, len(env.data) - 1):
-        window = env.data[i - env.window_size: i]  # The past
+        # Use _get_observation to include human strategy features
+        obs = env._get_observation(i)
         target = env.data[i][1]  # The Log_Ret of "today"
 
-        X_list.append(window.flatten())
+        X_list.append(obs)
         y_list.append(target)
 
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32).reshape(-1, 1)
 
 
-def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, hidden_dim=32, epochs_pretrain=100, steps_rl=20000):
+def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, hidden_dim=32, epochs_pretrain=150, steps_rl=100000):
     """
     Complete training pipeline:
     1. Pre-train predictor (supervised)
@@ -95,11 +97,14 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
     
     logger = setup_logging(config)
 
-    # 1. Initialize Environment
+    # 1. Initialize Environment with human-like strategies
     print("\nInitializing environment...")
-    env = StockTradingEnv(ticker=ticker, window_size=window_size, config=config, logger=logger)
+    env = StockTradingEnv(ticker=ticker, window_size=window_size, config=config, logger=logger, use_human_strategies=True)
     obs_dim = env.obs_shape
     action_dim = env.action_space.n
+    
+    print(f"   Human-like strategies: ENABLED")
+    print(f"   Observation includes {env.human_features_size} human strategy features")
 
     print(f"   Observation dimension: {obs_dim}")
     print(f"   Action dimension: {action_dim}")
@@ -154,14 +159,17 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
 
     # Transfer learned body to RL agent
     agent = KANActorCritic(obs_dim, action_dim, hidden_dim, pretrained_body=predictor.body).to(device)
-    # Lower learning rate for more stable training
-    optimizer_rl = optim.Adam(agent.parameters(), lr=0.0001)
+    # Learning rate - increased for faster convergence (was 0.0001, too low)
+    optimizer_rl = optim.Adam(agent.parameters(), lr=0.0003)
 
     # Reset environment and logger
     logger_trading = TradingLogger()
     state, _ = env.reset()
     episode_reward = 0
     memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
+    
+    # Track confidence statistics for reporting
+    confidence_history = []
 
     print(f"\n   Training for {steps_rl} steps...")
     print("   (Updates every 500 steps)")
@@ -197,6 +205,57 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
 
         # Step environment
         next_state, reward, done, _, _ = env.step(action)
+        
+        # FIXED: Add confidence bonus to encourage high confidence predictions
+        # Get confidence from action probabilities
+        with torch.no_grad():
+            confidence_probs = agent.get_action_confidence(state_tensor)
+            confidence = float(np.max(confidence_probs))  # Max probability = confidence
+            
+            # Extract individual action probabilities
+            hold_prob = float(confidence_probs[0]) if len(confidence_probs) > 0 else 0.0
+            buy_prob = float(confidence_probs[1]) if len(confidence_probs) > 1 else 0.0
+            sell_prob = float(confidence_probs[2]) if len(confidence_probs) > 2 else 0.0
+            
+            # Calculate confidence bonus first
+            if confidence > 0.70:  # High confidence (>70%)
+                confidence_bonus = 0.5  # Significant bonus
+            elif confidence > 0.60:  # Good confidence (60-70%)
+                confidence_bonus = 0.2
+            elif confidence > 0.50:  # Decent confidence (50-60%)
+                confidence_bonus = 0.1
+            elif confidence < 0.35:  # Very low confidence (<35%)
+                confidence_bonus = -0.1  # Small penalty
+            else:
+                confidence_bonus = 0.0  # Neutral for 35-50%
+            
+            # Get key features from observation for decision-making info
+            obs_array = state_tensor.cpu().numpy().flatten()
+            human_features = obs_array[env.window_size * 5:] if len(obs_array) > env.window_size * 5 else []
+            
+            # Extract actual market features from DataFrame (more accurate than observation array)
+            try:
+                current_idx = env.current_step
+                if current_idx < len(env.df):
+                    df_row = env.df.iloc[current_idx]
+                    last_close = float(df_row['Close']) if 'Close' in df_row else real_close if real_close else 0.0
+                    last_logret = float(df_row['Log_Ret']) if 'Log_Ret' in df_row else 0.0
+                    last_volnorm = float(df_row['Vol_Norm']) if 'Vol_Norm' in df_row else 0.0
+                    last_rsi = float(df_row['RSI_14']) if 'RSI_14' in df_row else 0.0
+                    last_macd = float(df_row['MACD_12_26_9']) if 'MACD_12_26_9' in df_row else 0.0
+                else:
+                    last_close = real_close if real_close else 0.0
+                    last_logret = last_volnorm = last_rsi = last_macd = 0.0
+            except Exception:
+                last_close = real_close if real_close else 0.0
+                last_logret = last_volnorm = last_rsi = last_macd = 0.0
+            
+            # Track confidence for statistics
+            confidence_history.append(confidence)
+            if len(confidence_history) > 500:
+                confidence_history.pop(0)  # Keep only last 500
+            
+            reward += confidence_bonus
 
         # Store in memory
         memory_states.append(torch.FloatTensor(state))
@@ -220,7 +279,11 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
                 discounted_reward = r + 0.99 * discounted_reward
                 rewards.insert(0, discounted_reward)
             rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+            
+            # FIXED: Don't normalize rewards - let model learn absolute profit
+            # Normalization causes training/backtest mismatch
+            # Instead, scale rewards to reasonable range (divide by 100 to get percentage-like scale)
+            rewards = rewards / 100.0  # Scale to percentage-like values (e.g., +5.0 reward = +5% profit)
 
             # PPO optimization
             for _ in range(3):
@@ -230,8 +293,10 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
                 advantages = rewards - state_values.detach()
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
-                # Increased entropy coefficient for better exploration
-                loss = -torch.min(surr1, surr2) + 0.5 * nn.MSELoss()(state_values, rewards) - 0.05 * dist_entropy
+                # FIXED: Reduced entropy coefficient to increase confidence
+                # Lower entropy = less exploration = higher confidence in predictions
+                # Increased from 0.02 to 0.005 to encourage more confident decisions
+                loss = -torch.min(surr1, surr2) + 0.5 * nn.MSELoss()(state_values, rewards) - 0.005 * dist_entropy
 
                 optimizer_rl.zero_grad()
                 loss.mean().backward()
@@ -239,10 +304,77 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=0.5)
                 optimizer_rl.step()
 
+            # Get last action before clearing memory
+            last_action_str = "skip"
+            if len(memory_actions) > 0:
+                last_action = int(memory_actions[-1].item())
+                last_action_str = ["skip", "buy", "sell"][last_action]
+            
             # Clear memory
             memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
 
-            print(f"   Step {step:5d}/{steps_rl} | Episode Reward: {episode_reward:.2f}")
+            # Calculate confidence statistics from history
+            if len(confidence_history) > 0:
+                conf_max = np.max(confidence_history)
+                conf_mean = np.mean(confidence_history)
+                conf_min = np.min(confidence_history)
+            else:
+                conf_max = conf_mean = conf_min = 0.0
+            
+            # Get current step's detailed info for display
+            with torch.no_grad():
+                current_state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                current_conf_probs = agent.get_action_confidence(current_state_tensor)
+                current_confidence = float(np.max(current_conf_probs))
+                current_hold_prob = float(current_conf_probs[0]) if len(current_conf_probs) > 0 else 0.0
+                current_buy_prob = float(current_conf_probs[1]) if len(current_conf_probs) > 1 else 0.0
+                current_sell_prob = float(current_conf_probs[2]) if len(current_conf_probs) > 2 else 0.0
+                
+                # Get current market features
+                current_obs_array = current_state_tensor.cpu().numpy().flatten()
+                current_human_features = current_obs_array[env.window_size * 5:] if len(current_obs_array) > env.window_size * 5 else []
+                
+                try:
+                    current_idx = env.current_step
+                    if current_idx < len(env.df):
+                        df_row = env.df.iloc[current_idx]
+                        current_close = float(df_row['Close']) if 'Close' in df_row else 0.0
+                        current_logret = float(df_row['Log_Ret']) if 'Log_Ret' in df_row else 0.0
+                        current_volnorm = float(df_row['Vol_Norm']) if 'Vol_Norm' in df_row else 0.0
+                        current_rsi = float(df_row['RSI_14']) if 'RSI_14' in df_row else 0.0
+                        current_macd = float(df_row['MACD_12_26_9']) if 'MACD_12_26_9' in df_row else 0.0
+                    else:
+                        current_close = current_logret = current_volnorm = current_rsi = current_macd = 0.0
+                except Exception:
+                    current_close = current_logret = current_volnorm = current_rsi = current_macd = 0.0
+            
+            # Print detailed info every 500 steps
+            price_display = real_close if real_close else current_close
+            
+            print(f"\n{'='*80}")
+            print(f"Step {step:5d} | Action: {last_action_str.upper():4s} | Price: ${price_display:.2f}")
+            print(f"{'-'*80}")
+            print(f"CONFIDENCE PROBABILITIES (Current):")
+            print(f"  HOLD: {current_hold_prob:.2%} | BUY: {current_buy_prob:.2%} | SELL: {current_sell_prob:.2%} | Max: {current_confidence:.2%}")
+            print(f"{'-'*80}")
+            print(f"CONFIDENCE STATISTICS (Last 500 steps):")
+            print(f"  Max: {conf_max:.2%} | Mean: {conf_mean:.2%} | Min: {conf_min:.2%}")
+            print(f"{'-'*80}")
+            print(f"MARKET FEATURES (Last Bar):")
+            print(f"  Close: ${current_close:.2f} | Log Return: {current_logret:.4f} | Vol Norm: {current_volnorm:.2f}")
+            print(f"  RSI: {current_rsi:.2f} | MACD: {current_macd:.4f}")
+            if len(current_human_features) > 0:
+                current_price_rejection = current_human_features[8] if len(current_human_features) > 8 else 0.0
+                print(f"{'-'*80}")
+                print(f"HUMAN STRATEGY FEATURES:")
+                print(f"  Should Wait: {current_human_features[0]:.0f} | Hesitation: {current_human_features[1]:.0f}")
+                print(f"  Rapid Drop: {current_human_features[2]:.0f} | Unusual Vol: {current_human_features[3]:.0f}")
+                print(f"  Price Gap: {current_human_features[4]:.0f} | High Volatility: {current_human_features[5]:.0f}")
+                print(f"  Flash Crash: {current_human_features[6]:.0f} | Rapid Pump: {current_human_features[7]:.0f}")
+                print(f"  Price Rejection: {current_price_rejection:.0f}")
+            print(f"{'-'*80}")
+            print(f"REWARD: {reward:.4f} | Episode Reward: {episode_reward:.2f}")
+            print(f"{'='*80}\n")
 
         # Episode finished
         if done:
@@ -272,13 +404,13 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
 
 if __name__ == "__main__":
     # Configuration
-    MODE = "stock"  # "crypto" or "stock"
-    INTERVAL = "1d"  # "1h", "4h" for crypto; "1d" for stock
-    TICKER = "^ixic"  # NASDAQ Composite Index (for training)
+    MODE = "crypto"  # "crypto" or "stock"
+    INTERVAL = "1h"  # "1h", "4h" for crypto; "1d" for stock
+    TICKER = "ETH-USD" if MODE == "crypto" else "QQQ"  # Change to your ticker
     WINDOW_SIZE = 30
     HIDDEN_DIM = 32
-    EPOCHS_PRETRAIN = 100  # Increase for better pre-training
-    STEPS_RL = 50000  # Increased for better training (was 20000)
+    EPOCHS_PRETRAIN = 150  # Increased for better pre-training
+    STEPS_RL = 100000  # Increased for better convergence (was 50000)
 
     print("\n" + "=" * 60)
     print("MODEL TRAINING")

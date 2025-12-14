@@ -5,9 +5,9 @@ Automated paper trading using Alpaca API with your trained model.
 
 This script:
 1. Loads your trained model
-2. Gets real-time data from Alpaca
-3. Generates trading signals
-4. Executes paper trades automatically
+2. Gets historical data from yfinance (same as training, avoids Alpaca SIP subscription issues)
+3. Generates trading signals using the model
+4. Executes paper trades via Alpaca API
 5. Tracks performance in database
 
 Usage:
@@ -15,6 +15,10 @@ Usage:
 
 Configuration:
     Set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables
+
+Note:
+    Historical data is fetched from yfinance to avoid Alpaca SIP subscription requirements.
+    Alpaca API is used only for order execution and account management.
 """
 
 import os
@@ -23,11 +27,13 @@ import time
 import torch
 import numpy as np
 import pandas as pd
+import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 import logging
 from pathlib import Path
 import pytz
+import pandas_ta as ta
 
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
@@ -36,6 +42,7 @@ from alpaca_client import AlpacaClient
 from database import TradingDB
 from dapgio_improved import KANActorCritic, TradingConfig, setup_logging
 from predict import get_prediction, KANPredictor
+from human_like_strategies import HumanLikeStrategy
 
 # Setup logging
 logging.basicConfig(
@@ -101,10 +108,14 @@ class AlpacaPaperTradingBot:
         self.last_signal_time = None
         self.signals_history = []
         
+        # Initialize human-like strategy
+        self.human_strategy = HumanLikeStrategy(mode=mode)
+        
         logger.info(f"Bot initialized for {self.original_ticker} (Alpaca: {self.ticker})")
         logger.info(f"Min confidence: {min_confidence:.0%}")
         logger.info(f"Max positions: {max_positions}")
         logger.info(f"Position size: {position_size_pct:.0%} of buying power")
+        logger.info(f"Human-like strategies enabled: Market open wait, anomaly detection, hesitation logic")
     
     def _load_model(self, model_path: str):
         """Load trained model"""
@@ -112,22 +123,34 @@ class AlpacaPaperTradingBot:
             # Get observation dimension (from training)
             obs_dim = 150  # window_size * features (30 * 5)
             action_dim = 3  # skip, buy, sell
-            hidden_dim = 32
             
-            # Load actor-critic
+            # Extract hidden_dim from model filename if available
+            import re
+            hidden_dim = 32  # Default
+            match = re.search(r'_hd(\d+)\.pth', model_path)
+            if match:
+                hidden_dim = int(match.group(1))
+                logger.info(f"Detected hidden_dim={hidden_dim} from model filename")
+            
+            # Load actor-critic (the model file contains the full KANActorCritic)
             agent = KANActorCritic(obs_dim, action_dim, hidden_dim).to(self.device)
-            agent.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
-            agent.eval()
             
-            # Load predictor (if separate file exists)
-            predictor_path = model_path.replace('_crypto.pth', '_predictor.pth').replace('_stock.pth', '_predictor.pth')
-            if os.path.exists(predictor_path):
-                predictor = KANPredictor(obs_dim, hidden_dim).to(self.device)
-                predictor.load_state_dict(torch.load(predictor_path, map_location=self.device, weights_only=True))
-                predictor.eval()
+            # Try to load the model
+            state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+            
+            # Check if this is a KANActorCritic model or KANPredictor
+            if 'actor_head.weight' in state_dict:
+                # This is a KANActorCritic model - load it directly
+                agent.load_state_dict(state_dict)
+                agent.eval()
+                predictor = None  # Predictor is part of the agent body, not needed separately
+                logger.info("Loaded KANActorCritic model successfully")
+            elif 'head.weight' in state_dict:
+                # This is a KANPredictor model (shouldn't happen, but handle it)
+                logger.warning("Model file appears to be a KANPredictor, not KANActorCritic")
+                raise ValueError("Model file is a predictor, not an actor-critic model. Need KANActorCritic for trading.")
             else:
-                # Use predictor from agent
-                predictor = None
+                raise ValueError(f"Unknown model format in file. Keys: {list(state_dict.keys())[:5]}")
             
             logger.info("Model loaded successfully")
             return agent, predictor
@@ -136,43 +159,82 @@ class AlpacaPaperTradingBot:
             raise
     
     def get_market_data(self, days: int = 60) -> Optional[pd.DataFrame]:
-        """Get historical market data from Alpaca"""
+        """Get historical market data from yfinance (same as training)"""
         try:
-            # Calculate date range
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
+            # Use yfinance for historical data (same as training)
+            # This avoids Alpaca SIP subscription issues
+            logger.info(f"Fetching historical data for {self.original_ticker} from yfinance...")
             
-            # Get bars with appropriate timeframe
-            if self.mode == 'stock':
-                timeframe = '1Day'
-            elif self.interval == '1h':
-                timeframe = '1Hour'
-            elif self.interval == '4h':
-                timeframe = '1Hour'  # Alpaca doesn't have 4h, use 1h and aggregate later
+            # Determine period and interval (same as dapgio_improved.py)
+            if self.mode == 'crypto':
+                # For crypto: use intraday data
+                interval = self.interval  # "1h" or "4h"
+                # For 1h: yfinance allows up to 730 days (max), gives ~17,520 bars
+                period = "730d" if interval == "1h" else "120d"
             else:
-                timeframe = '1Hour'
+                # For stocks: use interval from config (can be "1h", "1d", etc.)
+                interval = self.interval if self.interval else "1d"
+                
+                # Adjust period based on interval to get sufficient data
+                if interval == "1h":
+                    # For hourly: request 2 years to get ~3,000+ hours (more data than daily!)
+                    period = "2y"
+                elif interval == "1d":
+                    # For daily: request 1 year to ensure enough data
+                    period = "1y"
+                else:
+                    # Default: use daily with 1 year
+                    interval = "1d"
+                    period = "1y"
             
-            # Get bars
-            bars = self.client.get_historical_bars(
-                symbol=self.ticker,
-                timeframe=timeframe,
-                start=start_date.strftime('%Y-%m-%d'),
-                end=end_date.strftime('%Y-%m-%d'),
-                limit=days * 24 if self.mode == 'crypto' else days  # More bars for hourly data
-            )
+            # Use original ticker for yfinance (handles ^ixic, QQQ, etc.)
+            ticker_for_yf = self.original_ticker
             
-            if not bars:
-                logger.warning(f"No data received for {self.ticker}")
+            # Download data with retry logic (same as dapgio_improved.py)
+            max_retries = 3
+            retry_delay = 2
+            df = None
+            
+            for attempt in range(max_retries):
+                try:
+                    df = yf.download(ticker_for_yf, period=period, interval=interval, progress=False, auto_adjust=True)
+                    if not df.empty:
+                        break
+                    else:
+                        logger.warning(f"Attempt {attempt + 1}/{max_retries}: Empty data for {ticker_for_yf}")
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries}: Download failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+            
+            if df is None or df.empty:
+                # Try alternative ticker format for crypto
+                if self.mode == "crypto" and "-" in ticker_for_yf:
+                    alt_ticker = ticker_for_yf.replace("-", "")
+                    logger.info(f"Trying alternative ticker format: {alt_ticker}")
+                    try:
+                        df = yf.download(alt_ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+                        if not df.empty:
+                            logger.info(f"Successfully downloaded data using {alt_ticker}")
+                    except:
+                        pass
+            
+            if df is None or df.empty:
+                logger.error(f"No data downloaded for {ticker_for_yf}")
                 return None
             
-            # Convert to DataFrame
-            df = pd.DataFrame(bars)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df.set_index('timestamp', inplace=True)
-            df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            # Fix MultiIndex
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            # Ensure required columns exist
+            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in df.columns for col in required_cols):
+                logger.error(f"Missing required columns. Got: {df.columns.tolist()}")
+                return None
             
             # Add technical indicators (same as training)
-            import pandas_ta as ta
             df.ta.rsi(length=14, append=True)
             df.ta.macd(fast=12, slow=26, signal=9, append=True)
             df.ta.bbands(length=20, std=2, append=True)
@@ -181,17 +243,26 @@ class AlpacaPaperTradingBot:
             df["Log_Ret"] = np.log(df["Close"] / df["Close"].shift(1))
             df["Vol_Norm"] = df["Volume"] / df["Volume"].rolling(20).mean()
             
-            # Normalize
+            # Normalize (same as training)
             df.dropna(inplace=True)
             if 'RSI_14' in df.columns:
                 df["RSI_14"] = df["RSI_14"] / 100.0
             if 'MACD_12_26_9' in df.columns:
                 df["MACD_12_26_9"] = (df["MACD_12_26_9"] - df["MACD_12_26_9"].mean()) / (df["MACD_12_26_9"].std() + 1e-7)
             
-            logger.info(f"Retrieved {len(df)} bars for {self.ticker}")
+            logger.info(f"Retrieved {len(df)} bars for {self.original_ticker} from yfinance")
+            
+            # Check if we have enough data
+            if len(df) < self.window_size:
+                logger.warning(
+                    f"Insufficient data: got {len(df)} bars, need at least {self.window_size} bars. "
+                    f"Requested period: {period}, interval: {interval}"
+                )
+                return None
+            
             return df
         except Exception as e:
-            logger.error(f"Error getting market data: {e}")
+            logger.error(f"Error getting market data from yfinance: {e}")
             return None
     
     def prepare_observation(self, df: pd.DataFrame) -> Optional[torch.Tensor]:
@@ -231,9 +302,17 @@ class AlpacaPaperTradingBot:
     def get_trading_signal(self) -> Optional[Dict]:
         """Get trading signal from model"""
         try:
-            # Get market data
+            # Get market data (request enough to ensure we have window_size after filtering)
             df = self.get_market_data(days=60)
-            if df is None or len(df) < self.window_size:
+            if df is None:
+                logger.warning("Failed to get market data")
+                return None
+            
+            if len(df) < self.window_size:
+                logger.warning(
+                    f"Insufficient data for signal: got {len(df)} bars, need {self.window_size} bars. "
+                    f"Please wait for more data or check data source."
+                )
                 return None
             
             # Prepare observation
@@ -244,30 +323,66 @@ class AlpacaPaperTradingBot:
             # Get prediction
             with torch.no_grad():
                 action, log_prob, value = self.model.act(obs, deterministic=True)
-                action = action.item()
                 
-                # Get confidence from log probability
-                confidence = torch.exp(log_prob).item()
+                # action is already an int (from act method), log_prob is a tensor
+                if isinstance(action, torch.Tensor):
+                    action = action.item()
+                else:
+                    action = int(action)  # Ensure it's an int
+                
+                # Get confidence from softmax probabilities (not log_prob)
+                # log_prob is log probability of selected action, which can be negative
+                # We need the max probability from softmax distribution
+                confidence_probs = self.model.get_action_confidence(obs)
+                confidence = float(np.max(confidence_probs))  # Max probability = confidence
             
             # Get current price
             current_price = float(df['Close'].iloc[-1])
             
             # Map action to signal
             action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
-            signal = action_map.get(action, 'HOLD')
+            model_signal = action_map.get(action, 'HOLD')
             
-            # Check confidence threshold
-            if confidence < self.min_confidence:
-                signal = 'HOLD'
-                logger.debug(f"Signal confidence {confidence:.2%} below threshold {self.min_confidence:.0%}")
+            # Apply human-like strategy logic
+            current_time = datetime.now()
+            decision = self.human_strategy.get_trading_decision(
+                df=df,
+                model_signal=model_signal,
+                model_confidence=confidence,
+                current_time=current_time
+            )
+            
+            # Use final signal from human-like strategy
+            final_signal = decision['final_signal']
+            final_confidence = decision['confidence']
+            
+            # Log human-like strategy reasoning
+            if decision['should_wait']:
+                logger.info(f"⏳ {decision['reasons'][0]}")
+            elif decision['hesitation']:
+                logger.warning(f"⚠️  Hesitation: {decision['reasons'][0]}")
+                logger.info(f"   Original signal: {model_signal}, Confidence reduced to {final_confidence:.2%}")
+            elif decision['reasons']:
+                logger.info(f"✅ {decision['reasons'][0]}")
+            
+            # Check confidence threshold (on final confidence)
+            if final_confidence < self.min_confidence:
+                final_signal = 'HOLD'
+                logger.debug(f"Final signal confidence {final_confidence:.2%} below threshold {self.min_confidence:.0%}")
             
             return {
                 'ticker': self.ticker,
-                'signal': signal,
-                'action': action,
-                'confidence': confidence,
+                'signal': final_signal,
+                'original_signal': model_signal,
+                'action': action_map.get(final_signal, 0),  # Convert back to action index
+                'confidence': final_confidence,
                 'price': current_price,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': current_time.isoformat(),
+                'human_strategy': {
+                    'should_wait': decision['should_wait'],
+                    'hesitation': decision['hesitation'],
+                    'reasons': decision['reasons']
+                }
             }
         except Exception as e:
             logger.error(f"Error getting signal: {e}")
@@ -443,7 +558,21 @@ class AlpacaPaperTradingBot:
                 logger.warning("No signal generated")
                 return
             
-            logger.info(f"Signal: {signal['signal']} | Confidence: {signal['confidence']:.2%} | Price: ${signal['price']:.2f}")
+            # Display signal information
+            logger.info(f"Model Signal: {signal.get('original_signal', signal['signal'])} | "
+                       f"Final Signal: {signal['signal']} | "
+                       f"Confidence: {signal['confidence']:.2%} | "
+                       f"Price: ${signal['price']:.2f}")
+            
+            # Show human-like strategy reasoning
+            if 'human_strategy' in signal:
+                hs = signal['human_strategy']
+                if hs.get('should_wait'):
+                    logger.info(f"⏸️  Waiting: {hs['reasons'][0] if hs['reasons'] else 'Market conditions'}")
+                elif hs.get('hesitation'):
+                    logger.warning(f"⚠️  Hesitating: {hs['reasons'][0] if hs['reasons'] else 'Anomaly detected'}")
+                else:
+                    logger.info(f"✅ Human strategy check passed: {hs['reasons'][0] if hs['reasons'] else 'All checks OK'}")
             
             # Save prediction to database
             self.db.add_prediction(
@@ -455,8 +584,10 @@ class AlpacaPaperTradingBot:
                 model_version="v0.1"
             )
             
-            # Execute if confident enough
-            if signal['confidence'] >= self.min_confidence:
+            # Execute if confident enough and not waiting
+            if signal.get('human_strategy', {}).get('should_wait'):
+                logger.info("⏸️  Skipping trade execution - waiting for market conditions")
+            elif signal['confidence'] >= self.min_confidence:
                 self.execute_signal(signal)
             else:
                 logger.info(f"Signal confidence {signal['confidence']:.2%} below threshold {self.min_confidence:.0%}, skipping")

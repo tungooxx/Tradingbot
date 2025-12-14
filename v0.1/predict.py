@@ -73,11 +73,17 @@ def get_prediction(ticker="ETH-USD", mode="crypto", interval="1h", model_path=No
         print(f"📥 Fetching data for {ticker}...")
         if mode == "crypto":
             # For crypto: use intraday data
-            period = "60d" if interval == "1h" else "120d"
+            # For 1h: yfinance allows up to 730 days (max), gives ~17,520 bars
+            period = "730d" if interval == "1h" else "120d"
             df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         else:
-            # For stocks: use daily data
-            df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
+            # For stocks: use interval from parameter (can be "1h", "1d", etc.)
+            stock_interval = interval if interval else "1d"
+            if stock_interval == "1h":
+                period = "2y"  # For hourly: request 2 years (more data than daily!)
+            else:
+                period = "6mo"  # For daily: request 6 months
+            df = yf.download(ticker, period=period, interval=stock_interval, progress=False, auto_adjust=True)
 
         if df.empty:
             raise ValueError(f"No data downloaded for {ticker}")
@@ -233,9 +239,9 @@ def save_predictions(predictions, filename="predictions.json"):
 
 if __name__ == "__main__":
     # Configuration
-    MODE = "stock"  # "crypto" or "stock"
-    INTERVAL = "1d"  # "1h", "4h" for crypto; "1d" for stock
-    TICKERS = ["^ixic"] if MODE == "stock" else ["ETH-USD"]  # NASDAQ for stocks, ETH-USD for crypto
+    MODE = "crypto"  # "crypto" or "stock"
+    INTERVAL = "1h"  # "1h", "4h" for crypto; "1d" for stock
+    TICKERS = ["ETH-USD"] if MODE == "crypto" else ["NVDA"]  # Add more tickers
     WINDOW_SIZE = 30
 
     print("\n" + "=" * 60)

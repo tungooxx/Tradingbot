@@ -35,15 +35,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 def prepare_pretraining_data(env):
-    """Extract windows (X) and next period Log Returns (y)"""
+    """Extract windows (X) and next period Log Returns (y)
+    Includes human strategy features if enabled"""
     X_list = []
     y_list = []
 
     for i in range(env.window_size, len(env.data) - 1):
-        window = env.data[i - env.window_size : i]
+        # Use _get_observation to include human strategy features
+        obs = env._get_observation(i)
         target = env.data[i][1]  # Log_Ret
 
-        X_list.append(window.flatten())
+        X_list.append(obs)
         y_list.append(target)
 
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32).reshape(-1, 1)
@@ -85,7 +87,7 @@ def train_enhanced_model(ticker="ETH-USD", mode="crypto", interval="1h",
                                  config=config, logger=logger, use_moe=True)
     else:
         env = StockTradingEnv(ticker=ticker, window_size=window_size, 
-                              config=config, logger=logger)
+                              config=config, logger=logger, use_human_strategies=True)
     
     obs_dim = env.obs_shape
     action_dim = env.action_space.n
