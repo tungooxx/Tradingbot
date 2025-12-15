@@ -22,7 +22,8 @@ from dapgio_improved import (
     KANPredictor,
     KANActorCritic,
     TradingConfig,
-    setup_logging
+    setup_logging,
+    TradingLogger
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -162,6 +163,10 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
     # Reset environment
     state, _ = env.reset()
     memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
+    
+    # Initialize tracking variables
+    episode_reward = 0.0
+    logger_trading = TradingLogger()
 
     for step in range(1, steps_rl + 1):
         # Get action
@@ -178,6 +183,7 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
         memory_rewards.append(reward)
 
         state = next_state
+        episode_reward += reward
 
         # PPO Update
         if step % 500 == 0:
@@ -212,9 +218,21 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
             # Clear memory
             memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
 
+            print(f"   Step {step:5d}/{steps_rl} | Episode Reward: {episode_reward:.2f}")
+
         # Episode finished
         if done:
+            results = logger_trading.get_results()
+            if not results.empty:
+                total_profit = results['Profit'].sum()
+                print(f"\n   🏁 Episode Complete:")
+                print(f"      Total Reward: {episode_reward:.2f}")
+                print(f"      Total Profit: ${total_profit:.2f}")
+
+            # Reset for next episode
             state, _ = env.reset()
+            episode_reward = 0
+            logger_trading = TradingLogger()
 
     # ==========================================
     # SAVE MODEL
@@ -235,7 +253,7 @@ if __name__ == "__main__":
     TICKER = "ETH-USD" if MODE == "crypto" else "QQQ"  # Change to your ticker
     WINDOW_SIZE = 30
     HIDDEN_DIM = 32
-    EPOCHS_PRETRAIN = 150  # Increased for better pre-training
+    EPOCHS_PRETRAIN = 50  # Increased for better pre-training
     STEPS_RL = 100000  # Increased for better convergence (was 50000)
 
     print("\n" + "=" * 60)
