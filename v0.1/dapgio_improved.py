@@ -566,7 +566,7 @@ class StockTradingEnv(gym.Env):
             else:
                 # For stocks: use daily data
                 interval = "1d"
-                period = "5y"
+                period = "5y"  # Get 5 years to ensure enough data after cleaning
                 self.logger.info(f"Downloading {ticker} data (Stock mode: daily)...")
             
             # Retry logic for yfinance downloads
@@ -666,7 +666,24 @@ class StockTradingEnv(gym.Env):
             # Use rolling mean/std for normalization (more robust to distribution shifts)
             macd_mean = self.df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).mean()
             macd_std = self.df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).std()
-            self.df["MACD_12_26_9"] = (self.df["MACD_12_26_9"] - macd_mean) / (macd_std + 1e-7)
+            
+            # Handle case where std is 0 or NaN (all values same in window)
+            macd_std = macd_std.fillna(1e-7)  # Replace NaN std with small value
+            macd_std = macd_std.replace(0.0, 1e-7)  # Replace zero std with small value
+            
+            self.df["MACD_12_26_9"] = (self.df["MACD_12_26_9"] - macd_mean) / macd_std
+            
+            # Fill any remaining NaN values (can occur at the beginning of the series)
+            # Use forward fill then backward fill to handle edge cases
+            self.df["MACD_12_26_9"].fillna(method='ffill', inplace=True)
+            self.df["MACD_12_26_9"].fillna(method='bfill', inplace=True)
+            # If still NaN (shouldn't happen), fill with 0
+            self.df["MACD_12_26_9"].fillna(0.0, inplace=True)
+            
+            # Final dropna to remove any rows that still have NaN in other columns
+            self.df.dropna(inplace=True)
+            
+            # Note: Data length validation is done by DataValidator after this method
 
         except Exception as e:
             self.logger.error(f"Feature calculation failed: {e}", exc_info=True)

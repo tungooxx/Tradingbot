@@ -253,6 +253,10 @@ class LiveTradingWithRealtimeTraining:
                 logger.warning("Insufficient data for signal")
                 return None
             
+            # Fix MultiIndex columns (same as dapgio_improved.py)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
             # Feature engineering (same as predict.py)
             df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
             df['Vol_Norm'] = df['Volume'] / df['Volume'].rolling(20).mean()
@@ -276,7 +280,20 @@ class LiveTradingWithRealtimeTraining:
             
             macd_mean = df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).mean()
             macd_std = df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).std()
-            df["MACD_12_26_9"] = (df["MACD_12_26_9"] - macd_mean) / (macd_std + 1e-7)
+            
+            # Handle case where std is 0 or NaN (all values same in window)
+            macd_std = macd_std.fillna(1e-7)  # Replace NaN std with small value
+            macd_std = macd_std.replace(0.0, 1e-7)  # Replace zero std with small value
+            
+            df["MACD_12_26_9"] = (df["MACD_12_26_9"] - macd_mean) / macd_std
+            
+            # Fill any remaining NaN values (can occur at the beginning of the series)
+            df["MACD_12_26_9"].fillna(method='ffill', inplace=True)
+            df["MACD_12_26_9"].fillna(method='bfill', inplace=True)
+            df["MACD_12_26_9"].fillna(0.0, inplace=True)
+            
+            # Final dropna to remove any rows that still have NaN in other columns
+            df.dropna(inplace=True)
             
             features = ["Close", "Log_Ret", "Vol_Norm", "RSI_14", "MACD_12_26_9"]
             
@@ -590,7 +607,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="stock", choices=["stock", "crypto"], help="Trading mode")
     parser.add_argument("--interval", type=str, default="1d", help="Data interval")
     parser.add_argument("--model", type=str, default="kan_agent_stock.pth", help="Model path")
-    parser.add_argument("--window-size", type=int, default=30, help="Window size")
+    parser.add_argument("--window-size", type=int, default=72, help="Window size")
     parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension")
     parser.add_argument("--min-confidence", type=float, default=0.50, help="Min confidence")
     parser.add_argument("--max-positions", type=int, default=3, help="Max positions")
