@@ -196,6 +196,12 @@ class LiveTradingWithRealtimeTraining:
         self.last_training_time = datetime.now()
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         
+        # Performance tracking
+        self.total_reward = 0.0
+        self.total_profit = 0.0  # Realized P&L from closed trades
+        self.total_trades_executed = 0
+        self.initial_portfolio_value = None
+        
         # Trading state
         self.last_signal_time = None
         self.current_state = None
@@ -536,6 +542,12 @@ class LiveTradingWithRealtimeTraining:
             # Calculate reward from trade outcome
             trade_reward = self._calculate_reward_from_trade(signal, executed, pnl)
             
+            # Update performance tracking
+            self.total_reward += trade_reward
+            if pnl is not None:
+                self.total_profit += pnl
+                self.total_trades_executed += 1
+            
             # Collect experience
             self.collect_experience(
                 state=self.current_state,
@@ -548,6 +560,37 @@ class LiveTradingWithRealtimeTraining:
             
             # Update state
             self.current_state = next_obs
+            
+            # Get current portfolio value from Alpaca
+            try:
+                account = self.client.get_account()
+                current_portfolio_value = float(account['portfolio_value'])
+                current_balance = float(account['balance'])
+                
+                # Initialize on first run
+                if self.initial_portfolio_value is None:
+                    self.initial_portfolio_value = current_portfolio_value
+                
+                # Calculate total return
+                total_return = current_portfolio_value - self.initial_portfolio_value
+                total_return_pct = (total_return / self.initial_portfolio_value * 100) if self.initial_portfolio_value > 0 else 0.0
+                
+                # Display performance stats
+                logger.info(f"Performance Stats:")
+                logger.info(f"   Total Reward: {self.total_reward:.4f}")
+                logger.info(f"   Realized Profit (closed trades): ${self.total_profit:.2f}")
+                logger.info(f"   Portfolio Value: ${current_portfolio_value:.2f}")
+                logger.info(f"   Total Return: ${total_return:.2f} ({total_return_pct:+.2f}%)")
+                logger.info(f"   Trades Executed: {self.total_trades_executed}")
+                if self.total_trades_executed > 0:
+                    avg_profit = self.total_profit / self.total_trades_executed
+                    logger.info(f"   Avg Profit per Trade: ${avg_profit:.2f}")
+            except Exception as e:
+                logger.warning(f"Could not fetch portfolio value: {e}")
+                logger.info(f"Performance Stats:")
+                logger.info(f"   Total Reward: {self.total_reward:.4f}")
+                logger.info(f"   Realized Profit: ${self.total_profit:.2f}")
+                logger.info(f"   Trades Executed: {self.total_trades_executed}")
             
             # Train if enough trades
             if self.trade_count > 0 and self.trade_count % self.training_interval_trades == 0:
@@ -581,7 +624,22 @@ class LiveTradingWithRealtimeTraining:
                 self.run_once()
                 
                 logger.info(f"Waiting {check_interval_minutes} minutes until next check...")
-                logger.info(f"  Total trades: {self.trade_count}")
+                logger.info(f"  Total trades attempted: {self.trade_count}")
+                logger.info(f"  Total trades executed: {self.total_trades_executed}")
+                logger.info(f"  Total Reward: {self.total_reward:.4f}")
+                logger.info(f"  Realized Profit: ${self.total_profit:.2f}")
+                
+                # Show portfolio value if available
+                try:
+                    account = self.client.get_account()
+                    current_portfolio_value = float(account['portfolio_value'])
+                    if self.initial_portfolio_value is not None:
+                        total_return = current_portfolio_value - self.initial_portfolio_value
+                        total_return_pct = (total_return / self.initial_portfolio_value * 100) if self.initial_portfolio_value > 0 else 0.0
+                        logger.info(f"  Portfolio Value: ${current_portfolio_value:.2f} (Return: ${total_return:.2f}, {total_return_pct:+.2f}%)")
+                except:
+                    pass
+                
                 logger.info(f"  Experience buffer: {len(self.experience_buffer)}")
                 
                 # Wait for next check
@@ -598,6 +656,34 @@ class LiveTradingWithRealtimeTraining:
                 logger.info("Final training before shutdown...")
                 self.train_on_experience()
             self._save_model()
+            
+            # Final performance summary
+            logger.info("\n" + "=" * 60)
+            logger.info("FINAL PERFORMANCE SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Total Trades Attempted: {self.trade_count}")
+            logger.info(f"Total Trades Executed: {self.total_trades_executed}")
+            logger.info(f"Total Reward: {self.total_reward:.4f}")
+            logger.info(f"Realized Profit (closed trades): ${self.total_profit:.2f}")
+            
+            # Get final portfolio value
+            try:
+                account = self.client.get_account()
+                final_portfolio_value = float(account['portfolio_value'])
+                if self.initial_portfolio_value is not None:
+                    total_return = final_portfolio_value - self.initial_portfolio_value
+                    total_return_pct = (total_return / self.initial_portfolio_value * 100) if self.initial_portfolio_value > 0 else 0.0
+                    logger.info(f"Initial Portfolio Value: ${self.initial_portfolio_value:.2f}")
+                    logger.info(f"Final Portfolio Value: ${final_portfolio_value:.2f}")
+                    logger.info(f"Total Return: ${total_return:.2f} ({total_return_pct:+.2f}%)")
+            except Exception as e:
+                logger.warning(f"Could not fetch final portfolio value: {e}")
+            
+            if self.total_trades_executed > 0:
+                avg_profit = self.total_profit / self.total_trades_executed
+                logger.info(f"Average Profit per Trade: ${avg_profit:.2f}")
+            logger.info(f"Experience Collected: {len(self.experience_buffer)}")
+            logger.info("=" * 60)
             logger.info("Shutdown complete")
 
 
