@@ -25,29 +25,30 @@ from dapgio_improved import (
     setup_logging,
     TradingLogger
 )
+from trading_constraints_env import create_constrained_env
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
 def prepare_pretraining_data(env):
-    """Extract windows (X) and next day Log Returns (y) from environment data
-    Includes human strategy features if enabled"""
+    """Extract windows (X) and next day Log Returns (y) from environment data"""
     X_list = []
     y_list = []
 
     for i in range(env.window_size, len(env.data) - 1):
-        # Use _get_observation to include human strategy features
-        obs = env._get_observation(i)
+        window = env.data[i - env.window_size: i]  # The past
         target = env.data[i][1]  # The Log_Ret of "today"
 
-        X_list.append(obs)
+        X_list.append(window.flatten())
         y_list.append(target)
 
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32).reshape(-1, 1)
 
 
-def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, hidden_dim=32, epochs_pretrain=150, steps_rl=100000):
+def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, hidden_dim=32, 
+                epochs_pretrain=150, steps_rl=100000, use_trading_constraints: bool = True,
+                min_confidence: float = 0.50, max_positions: int = 3, position_size_pct: float = 0.10):
     """
     Complete training pipeline:
     1. Pre-train predictor (supervised)
@@ -97,14 +98,28 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
     
     logger = setup_logging(config)
 
-    # 1. Initialize Environment with human-like strategies
+    # 1. Initialize Environment
     print("\nInitializing environment...")
-    env = StockTradingEnv(ticker=ticker, window_size=window_size, config=config, logger=logger, use_human_strategies=True)
+    if use_trading_constraints:
+        print("   Using trading constraints (matches alpaca_paper_trading.py):")
+        print(f"      Min confidence: {min_confidence:.0%}")
+        print(f"      Max positions: {max_positions}")
+        print(f"      Position size: {position_size_pct:.0%}")
+        env = create_constrained_env(
+            ticker=ticker,
+            window_size=window_size,
+            config=config,
+            min_confidence=min_confidence,
+            max_positions=max_positions,
+            position_size_pct=position_size_pct,
+            logger=logger
+        )
+    else:
+        env = StockTradingEnv(ticker=ticker, window_size=window_size, config=config, logger=logger)
+    
     obs_dim = env.obs_shape
     action_dim = env.action_space.n
-    
-    print(f"   Human-like strategies: ENABLED")
-    print(f"   Observation includes {env.human_features_size} human strategy features")
+
     print(f"   Observation dimension: {obs_dim}")
     print(f"   Action dimension: {action_dim}")
     print(f"   Data points: {len(env.data)}")
@@ -158,23 +173,67 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
 
     # Transfer learned body to RL agent
     agent = KANActorCritic(obs_dim, action_dim, hidden_dim, pretrained_body=predictor.body).to(device)
+    # Learning rate - increased for faster convergence (was 0.0001, too low)
     optimizer_rl = optim.Adam(agent.parameters(), lr=0.0003)
 
-    # Reset environment
+    # Reset environment and logger
+    logger_trading = TradingLogger()
     state, _ = env.reset()
+    episode_reward = 0
     memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
     
-    # Initialize tracking variables
-    episode_reward = 0.0
-    logger_trading = TradingLogger()
+    # Track cumulative totals across all episodes
+    total_cumulative_reward = 0.0
+    total_cumulative_profit = 0.0
+
+    print(f"\n   Training for {steps_rl} steps...")
+    print("   (Updates every 500 steps, cumulative stats every 10000 steps)")
 
     for step in range(1, steps_rl + 1):
-        # Get action
+        # Get action and confidence
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-        action, log_prob, _ = agent.act(state_tensor, deterministic=False)
+        action, log_prob, _ = agent.act(state_tensor, deterministic=False)  # Use sampling for training
+        
+        # Get action confidence for constrained environment
+        action_confidence = None
+        if use_trading_constraints:
+            with torch.no_grad():
+                confidence_probs = agent.get_action_confidence(state_tensor)
+                action_confidence = float(np.max(confidence_probs))
+
+        # Logging
+        current_idx = env.current_step
+        try:
+            date = env.df.index[current_idx]
+            open_price = float(env.df['Open'].iloc[current_idx]) if 'Open' in env.df.columns else None
+            high_price = float(env.df['High'].iloc[current_idx]) if 'High' in env.df.columns else None
+            low_price = float(env.df['Low'].iloc[current_idx]) if 'Low' in env.df.columns else None
+            real_close = float(env.df['Close'].iloc[current_idx])
+        except Exception as e:
+            date, open_price, high_price, low_price, real_close = None, None, None, None, None
+
+        act_str = ["skip", "buy", "sell"][int(action)]
+
+        # Get prediction
+        pred_close = None
+        try:
+            with torch.no_grad():
+                pred_logret = predictor(state_tensor)
+                pred_close = float(real_close * np.exp(pred_logret.item())) if real_close is not None else None
+        except Exception:
+            pred_close = None
+
+        logger_trading.log_step(date, open_price, high_price, low_price, real_close, pred_close, act_str)
 
         # Step environment
-        next_state, reward, done, _, _ = env.step(action)
+        # Step environment (with confidence if using constraints)
+        if use_trading_constraints:
+            next_state, reward, done, _, info = env.step(action, action_confidence=action_confidence)
+            # Log if action was blocked
+            if 'action_blocked' in info:
+                logger.debug(f"Step {step}: Action {action} blocked: {info.get('action_blocked')}")
+        else:
+            next_state, reward, done, _, info = env.step(action)
 
         # Store in memory
         memory_states.append(torch.FloatTensor(state))
@@ -208,10 +267,13 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
                 advantages = rewards - state_values.detach()
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
+                # Entropy coefficient - slightly increased to encourage exploration (more trading)
+                # But still lower than before to maintain confidence
                 loss = -torch.min(surr1, surr2) + 0.5 * nn.MSELoss()(state_values, rewards) - 0.02 * dist_entropy
 
                 optimizer_rl.zero_grad()
                 loss.mean().backward()
+                # Gradient clipping to prevent exploding gradients
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=0.5)
                 optimizer_rl.step()
 
@@ -225,6 +287,9 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
             results = logger_trading.get_results()
             if not results.empty:
                 total_profit = results['Profit'].sum()
+                # Accumulate cumulative totals
+                total_cumulative_reward += episode_reward
+                total_cumulative_profit += total_profit
                 print(f"\n   🏁 Episode Complete:")
                 print(f"      Total Reward: {episode_reward:.2f}")
                 print(f"      Total Profit: ${total_profit:.2f}")
@@ -233,6 +298,23 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
             state, _ = env.reset()
             episode_reward = 0
             logger_trading = TradingLogger()
+        
+        # Log cumulative totals every 10000 steps
+        if step % 10000 == 0:
+            # Get current episode profit if available
+            current_profit = 0.0
+            results = logger_trading.get_results()
+            if not results.empty:
+                current_profit = results['Profit'].sum()
+            
+            # Calculate totals including current episode
+            current_total_reward = total_cumulative_reward + episode_reward
+            current_total_profit = total_cumulative_profit + current_profit
+            
+            print(f"\n   📊 Cumulative Stats at Step {step}:")
+            print(f"      Total Reward (all episodes): {current_total_reward:.2f}")
+            print(f"      Total Profit (all episodes): ${current_total_profit:.2f}")
+            print()
 
     # ==========================================
     # SAVE MODEL
@@ -248,13 +330,19 @@ def train_model(ticker="ETH-USD", mode="crypto", interval="1h", window_size=30, 
 
 if __name__ == "__main__":
     # Configuration
-    MODE = "crypto"  # "crypto" or "stock"
-    INTERVAL = "1h"  # "1h", "4h" for crypto; "1d" for stock
-    TICKER = "ETH-USD" if MODE == "crypto" else "QQQ"  # Change to your ticker
+    MODE = "stock"  # "crypto" or "stock"
+    INTERVAL = "1d"  # "1h", "4h" for crypto; "1d" for stock
+    TICKER = "NVDA" if MODE == "crypto" else "QQQ"  # Change to your ticker
     WINDOW_SIZE = 30
-    HIDDEN_DIM = 32
-    EPOCHS_PRETRAIN = 50  # Increased for better pre-training
+    HIDDEN_DIM = 72
+    EPOCHS_PRETRAIN = 150  # Increased for better pre-training
     STEPS_RL = 100000  # Increased for better convergence (was 50000)
+    
+    # Trading constraints (matches alpaca_paper_trading.py)
+    USE_TRADING_CONSTRAINTS = True  # Set to True to train with real constraints
+    MIN_CONFIDENCE = 0.50  # Minimum confidence to trade
+    MAX_POSITIONS = 3  # Maximum concurrent positions
+    POSITION_SIZE_PCT = 0.10  # Position size as % of account
 
     print("\n" + "=" * 60)
     print("MODEL TRAINING")
@@ -274,7 +362,11 @@ if __name__ == "__main__":
             window_size=WINDOW_SIZE,
             hidden_dim=HIDDEN_DIM,
             epochs_pretrain=EPOCHS_PRETRAIN,
-            steps_rl=STEPS_RL
+            steps_rl=STEPS_RL,
+            use_trading_constraints=USE_TRADING_CONSTRAINTS,
+            min_confidence=MIN_CONFIDENCE,
+            max_positions=MAX_POSITIONS,
+            position_size_pct=POSITION_SIZE_PCT
         )
         print("\nTraining completed successfully!")
         print("Next steps:")

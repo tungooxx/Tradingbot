@@ -42,7 +42,6 @@ from alpaca_client import AlpacaClient
 from database import TradingDB
 from dapgio_improved import KANActorCritic, TradingConfig, setup_logging
 from predict import get_prediction, KANPredictor
-from human_like_strategies import HumanLikeStrategy
 
 # Setup logging
 logging.basicConfig(
@@ -108,14 +107,10 @@ class AlpacaPaperTradingBot:
         self.last_signal_time = None
         self.signals_history = []
         
-        # Initialize human-like strategy
-        self.human_strategy = HumanLikeStrategy(mode=mode)
-        
         logger.info(f"Bot initialized for {self.original_ticker} (Alpaca: {self.ticker})")
         logger.info(f"Min confidence: {min_confidence:.0%}")
         logger.info(f"Max positions: {max_positions}")
         logger.info(f"Position size: {position_size_pct:.0%} of buying power")
-        logger.info(f"Human-like strategies enabled: Market open wait, anomaly detection, hesitation logic")
     
     def _load_model(self, model_path: str):
         """Load trained model"""
@@ -169,23 +164,13 @@ class AlpacaPaperTradingBot:
             if self.mode == 'crypto':
                 # For crypto: use intraday data
                 interval = self.interval  # "1h" or "4h"
-                # For 1h: yfinance allows up to 730 days (max), gives ~17,520 bars
-                period = "730d" if interval == "1h" else "120d"
+                period = "60d" if interval == "1h" else "120d"
             else:
-                # For stocks: use interval from config (can be "1h", "1d", etc.)
-                interval = self.interval if self.interval else "1d"
-                
-                # Adjust period based on interval to get sufficient data
-                if interval == "1h":
-                    # For hourly: request 2 years to get ~3,000+ hours (more data than daily!)
-                    period = "2y"
-                elif interval == "1d":
-                    # For daily: request 1 year to ensure enough data
-                    period = "1y"
-                else:
-                    # Default: use daily with 1 year
-                    interval = "1d"
-                    period = "1y"
+                # For stocks: use daily data
+                # Request at least 1 year to ensure we have enough data after filtering
+                # (accounts for weekends, holidays, and dropna())
+                interval = "1d"
+                period = "1y"  # Always request 1 year for stocks to ensure enough data
             
             # Use original ticker for yfinance (handles ^ixic, QQQ, etc.)
             ticker_for_yf = self.original_ticker
@@ -341,48 +326,20 @@ class AlpacaPaperTradingBot:
             
             # Map action to signal
             action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
-            model_signal = action_map.get(action, 'HOLD')
+            signal = action_map.get(action, 'HOLD')
             
-            # Apply human-like strategy logic
-            current_time = datetime.now()
-            decision = self.human_strategy.get_trading_decision(
-                df=df,
-                model_signal=model_signal,
-                model_confidence=confidence,
-                current_time=current_time
-            )
-            
-            # Use final signal from human-like strategy
-            final_signal = decision['final_signal']
-            final_confidence = decision['confidence']
-            
-            # Log human-like strategy reasoning
-            if decision['should_wait']:
-                logger.info(f"⏳ {decision['reasons'][0]}")
-            elif decision['hesitation']:
-                logger.warning(f"⚠️  Hesitation: {decision['reasons'][0]}")
-                logger.info(f"   Original signal: {model_signal}, Confidence reduced to {final_confidence:.2%}")
-            elif decision['reasons']:
-                logger.info(f"✅ {decision['reasons'][0]}")
-            
-            # Check confidence threshold (on final confidence)
-            if final_confidence < self.min_confidence:
-                final_signal = 'HOLD'
-                logger.debug(f"Final signal confidence {final_confidence:.2%} below threshold {self.min_confidence:.0%}")
+            # Check confidence threshold
+            if confidence < self.min_confidence:
+                signal = 'HOLD'
+                logger.debug(f"Signal confidence {confidence:.2%} below threshold {self.min_confidence:.0%}")
             
             return {
                 'ticker': self.ticker,
-                'signal': final_signal,
-                'original_signal': model_signal,
-                'action': action_map.get(final_signal, 0),  # Convert back to action index
-                'confidence': final_confidence,
+                'signal': signal,
+                'action': action,
+                'confidence': confidence,
                 'price': current_price,
-                'timestamp': current_time.isoformat(),
-                'human_strategy': {
-                    'should_wait': decision['should_wait'],
-                    'hesitation': decision['hesitation'],
-                    'reasons': decision['reasons']
-                }
+                'timestamp': datetime.now().isoformat()
             }
         except Exception as e:
             logger.error(f"Error getting signal: {e}")
@@ -558,21 +515,7 @@ class AlpacaPaperTradingBot:
                 logger.warning("No signal generated")
                 return
             
-            # Display signal information
-            logger.info(f"Model Signal: {signal.get('original_signal', signal['signal'])} | "
-                       f"Final Signal: {signal['signal']} | "
-                       f"Confidence: {signal['confidence']:.2%} | "
-                       f"Price: ${signal['price']:.2f}")
-            
-            # Show human-like strategy reasoning
-            if 'human_strategy' in signal:
-                hs = signal['human_strategy']
-                if hs.get('should_wait'):
-                    logger.info(f"⏸️  Waiting: {hs['reasons'][0] if hs['reasons'] else 'Market conditions'}")
-                elif hs.get('hesitation'):
-                    logger.warning(f"⚠️  Hesitating: {hs['reasons'][0] if hs['reasons'] else 'Anomaly detected'}")
-                else:
-                    logger.info(f"✅ Human strategy check passed: {hs['reasons'][0] if hs['reasons'] else 'All checks OK'}")
+            logger.info(f"Signal: {signal['signal']} | Confidence: {signal['confidence']:.2%} | Price: ${signal['price']:.2f}")
             
             # Save prediction to database
             self.db.add_prediction(
@@ -584,10 +527,8 @@ class AlpacaPaperTradingBot:
                 model_version="v0.1"
             )
             
-            # Execute if confident enough and not waiting
-            if signal.get('human_strategy', {}).get('should_wait'):
-                logger.info("⏸️  Skipping trade execution - waiting for market conditions")
-            elif signal['confidence'] >= self.min_confidence:
+            # Execute if confident enough
+            if signal['confidence'] >= self.min_confidence:
                 self.execute_signal(signal)
             else:
                 logger.info(f"Signal confidence {signal['confidence']:.2%} below threshold {self.min_confidence:.0%}, skipping")

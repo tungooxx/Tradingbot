@@ -36,7 +36,6 @@ from typing import Optional, Dict, Tuple, List
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import warnings
-from human_like_strategies import HumanLikeStrategy
 
 warnings.filterwarnings('ignore')
 
@@ -552,57 +551,23 @@ class KANActorCritic(nn.Module):
 
 class StockTradingEnv(gym.Env):
     def __init__(self, ticker="ETH-USD", window_size=30, config: Optional[TradingConfig] = None,
-                 logger: Optional[logging.Logger] = None, use_human_strategies: bool = True):
+                 logger: Optional[logging.Logger] = None):
         super(StockTradingEnv, self).__init__()
         self.config = config or TradingConfig()
         self.logger = logger or logging.getLogger("TradingEnv")
-        self.use_human_strategies = use_human_strategies
-        
-        # Initialize human-like strategy module
-        if self.use_human_strategies:
-            self.human_strategy = HumanLikeStrategy(mode=self.config.mode)
-            self.logger.info("Human-like strategies enabled for training")
-        
-        # Statistics tracking for summary logging
-        self.stop_loss_count = 0
-        self.stop_loss_returns = []
-        self.take_profit_count = 0
-        self.take_profit_returns = []
-        self.step_count = 0
-        self.summary_interval = 100  # Log summary every 100 steps
-        
-        # Track human-like strategy decisions for reward shaping
-        self.last_human_decision = None
-        self.last_should_wait = False
-        self.last_hesitation = False
 
         try:
             # Determine data period and interval based on mode
             if self.config.mode == "crypto":
                 # For crypto: use intraday data (1h or 4h)
                 interval = self.config.interval  # "1h" or "4h"
-                # For 1h: yfinance allows up to 730 days (max), gives ~17,520 bars (730 * 24)
-                # For 4h: use 120d to get ~720 bars (120 * 6)
-                period = "730d" if interval == "1h" else "120d"  # Max allowed for 1h
-                self.logger.info(f"Downloading {ticker} data (Crypto mode: {interval}, period: {period})...")
+                period = "60d" if interval == "1h" else "120d"  # More data for hourly
+                self.logger.info(f"Downloading {ticker} data (Crypto mode: {interval})...")
             else:
-                # For stocks: use interval from config (can be "1h", "1d", etc.)
-                interval = self.config.interval if self.config.interval else "1d"
-                
-                # Adjust period based on interval to get sufficient data
-                if interval == "1h":
-                    # For hourly: request 2 years to get ~3,000+ hours (6.5 hours/day * 252 days * 2)
-                    # yfinance allows up to 730 days for 1h interval
-                    period = "2y"  # More data points than daily!
-                elif interval == "1d":
-                    # For daily: request 5 years to get ~1,260 trading days
-                    period = "5y"
-                else:
-                    # Default: use daily with 5 years
-                    interval = "1d"
-                    period = "5y"
-                
-                self.logger.info(f"Downloading {ticker} data (Stock mode: {interval}, period: {period})...")
+                # For stocks: use daily data
+                interval = "1d"
+                period = "5y"
+                self.logger.info(f"Downloading {ticker} data (Stock mode: daily)...")
             
             # Retry logic for yfinance downloads
             max_retries = 3
@@ -661,15 +626,7 @@ class StockTradingEnv(gym.Env):
             self.max_steps = len(self.data) - 1
 
             self.action_space = spaces.Discrete(3)
-            
-            # Add human-like strategy features to observation space
-            # Base features: window_size * num_features
-            # Human strategy features: 9 features (should_wait, hesitation, rapid_drop, unusual_volume, price_gap, 
-            # high_volatility, flash_crash, rapid_pump, price_rejection)
-            self.base_obs_shape = window_size * len(self.features)
-            self.human_features_size = 9 if self.use_human_strategies else 0
-            self.obs_shape = self.base_obs_shape + self.human_features_size
-            
+            self.obs_shape = window_size * len(self.features)
             self.observation_space = spaces.Box(
                 low=-np.inf, high=np.inf, shape=(self.obs_shape,), dtype=np.float32
             )
@@ -695,9 +652,21 @@ class StockTradingEnv(gym.Env):
             # Normalize
             self.df.dropna(inplace=True)
             self.df["RSI_14"] = self.df["RSI_14"] / 100.0
-            self.df["MACD_12_26_9"] = (
-                                              self.df["MACD_12_26_9"] - self.df["MACD_12_26_9"].mean()
-                                      ) / (self.df["MACD_12_26_9"].std() + 1e-7)
+            
+            # Use rolling normalization for MACD to prevent distribution shift
+            # Use a fixed window (e.g., 252 bars for daily, 252*24=6048 for hourly)
+            # This ensures consistent normalization across training and prediction
+            if self.config.interval == "1h":
+                rolling_window = 252 * 24  # ~1 year of hourly data
+            elif self.config.interval == "4h":
+                rolling_window = 252 * 6  # ~1 year of 4h data
+            else:  # daily
+                rolling_window = 252  # ~1 year of daily data
+            
+            # Use rolling mean/std for normalization (more robust to distribution shifts)
+            macd_mean = self.df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).mean()
+            macd_std = self.df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).std()
+            self.df["MACD_12_26_9"] = (self.df["MACD_12_26_9"] - macd_mean) / (macd_std + 1e-7)
 
         except Exception as e:
             self.logger.error(f"Feature calculation failed: {e}", exc_info=True)
@@ -710,196 +679,13 @@ class StockTradingEnv(gym.Env):
         self.shares = 0
         self.entry_price = 0
         self.initial_balance = 20.0
-        
-        # Reset statistics
-        self.stop_loss_count = 0
-        self.stop_loss_returns = []
-        self.take_profit_count = 0
-        self.take_profit_returns = []
-        self.step_count = 0
-        
         return self._get_observation(), {}
 
     def _get_observation(self, step=None):
         if step is None:
             step = self.current_step
-        
-        # Base observation: windowed features
         window = self.data[step - self.window_size: step]
-        obs = window.flatten().astype(np.float32)
-        
-        # Add human-like strategy features
-        if self.use_human_strategies:
-            human_features = self._get_human_strategy_features(step)
-            obs = np.concatenate([obs, human_features]).astype(np.float32)
-        
-        return obs
-    
-    def _get_human_strategy_features(self, step: int) -> np.ndarray:
-        """
-        Get human-like strategy features to add to observation space.
-        Features: [should_wait, hesitation, rapid_drop, unusual_volume, price_gap, high_volatility,
-                   flash_crash, rapid_pump, price_rejection]
-        """
-        features = np.zeros(9, dtype=np.float32)
-        
-        try:
-            # Get current DataFrame slice
-            if step >= len(self.df):
-                return features
-            
-            df_slice = self.df.iloc[:step+1] if step < len(self.df) else self.df
-            
-            # 1. Check if should wait after market open (for stocks)
-            if self.config.mode == "stock" and len(df_slice) > 0:
-                # Simulate current time from DataFrame index
-                current_time = None
-                if hasattr(df_slice.index, 'to_pydatetime'):
-                    try:
-                        current_time = df_slice.index[-1].to_pydatetime()
-                    except:
-                        pass
-                
-                should_wait, _ = self.human_strategy.should_wait_after_open(current_time, df_slice)
-                features[0] = 1.0 if should_wait else 0.0
-            
-            # 2. Detect anomalies
-            if len(df_slice) >= 10:
-                anomalies = self.human_strategy.detect_anomalies(df_slice, lookback_bars=min(10, len(df_slice)))
-                
-                if anomalies['has_anomalies']:
-                    flags = anomalies.get('flags', {})
-                    features[1] = 1.0 if anomalies['has_anomalies'] else 0.0  # hesitation flag
-                    features[2] = 1.0 if flags.get('rapid_drop', False) else 0.0
-                    features[3] = 1.0 if flags.get('unusual_volume', False) else 0.0
-                    features[4] = 1.0 if flags.get('price_gap', False) else 0.0
-                    features[5] = 1.0 if flags.get('high_volatility', False) else 0.0
-                    features[6] = 1.0 if flags.get('flash_crash', False) else 0.0
-                    features[7] = 1.0 if flags.get('rapid_pump', False) else 0.0
-                    # Price rejection: combine high and low rejection
-                    features[8] = 1.0 if (flags.get('price_rejection_high', False) or 
-                                         flags.get('price_rejection_low', False)) else 0.0
-            
-        except Exception as e:
-            # If error occurs, return zeros (no human strategy signals)
-            self.logger.debug(f"Error getting human strategy features: {e}")
-        
-        return features
-    
-    def _calculate_human_strategy_reward(self, action: int) -> float:
-        """
-        Calculate reward bonus/penalty based on human-like strategy behavior.
-        Encourages the agent to:
-        - Wait when it should wait (after market open)
-        - Hesitate when anomalies are detected
-        - Avoid trading when conditions are abnormal
-        """
-        reward_bonus = 0.0
-        
-        try:
-            if self.current_step >= len(self.df):
-                return reward_bonus
-            
-            df_slice = self.df.iloc[:self.current_step+1] if self.current_step < len(self.df) else self.df
-            
-            # Convert action to signal string
-            action_signal = ["HOLD", "BUY", "SELL"][action]
-            
-            # 1. Check if should wait after market open
-            if self.config.mode == "stock" and len(df_slice) > 0:
-                current_time = None
-                if hasattr(df_slice.index, 'to_pydatetime'):
-                    try:
-                        current_time = df_slice.index[-1].to_pydatetime()
-                    except:
-                        pass
-                
-                should_wait, wait_reason = self.human_strategy.should_wait_after_open(current_time, df_slice)
-                self.last_should_wait = should_wait
-                
-                if should_wait:
-                    # Reward HOLD when should wait, penalize trading
-                    if action == 0:  # HOLD
-                        reward_bonus += 0.01  # Small reward for waiting
-                    else:  # BUY or SELL
-                        reward_bonus -= 0.02  # Penalty for trading during wait period
-            
-            # 2. Check market conditions
-            if len(df_slice) >= 20:
-                market_conditions = self.human_strategy.check_market_conditions(df_slice)
-                
-                if not market_conditions.get('is_normal', True):
-                    # Market conditions are abnormal
-                    if action == 0:  # HOLD
-                        reward_bonus += 0.015  # Reward for not trading in abnormal conditions
-                    else:  # Trading in abnormal conditions
-                        reward_bonus -= 0.01  # Small penalty
-            
-            # 3. Check for hesitation (anomalies detected)
-            if len(df_slice) >= 10:
-                should_hesitate, hesitation_reason = self.human_strategy.should_hesitate(df_slice, action_signal)
-                self.last_hesitation = should_hesitate
-                
-                if should_hesitate:
-                    # If anomalies detected, reward HOLD or reduce confidence
-                    if action == 0:  # HOLD
-                        reward_bonus += 0.025  # Reward for hesitating (increased)
-                    elif action == 1:  # BUY during anomalies
-                        if "rapid drop" in hesitation_reason.lower() or "flash crash" in hesitation_reason.lower():
-                            reward_bonus -= 0.04  # Penalty for buying into falling knife (increased)
-                        elif "price rejection" in hesitation_reason.lower() and "high" in hesitation_reason.lower():
-                            reward_bonus -= 0.03  # Penalty for buying at rejection
-                        elif "rapid pump" in hesitation_reason.lower():
-                            reward_bonus -= 0.02  # Penalty for buying into pump
-                    elif action == 2:  # SELL during anomalies
-                        if "flash crash" in hesitation_reason.lower():
-                            reward_bonus -= 0.03  # Penalty for panic selling (increased)
-                        elif "price rejection" in hesitation_reason.lower() and "low" in hesitation_reason.lower():
-                            reward_bonus -= 0.03  # Penalty for selling at support rejection
-                        elif "rapid pump" in hesitation_reason.lower():
-                            reward_bonus -= 0.02  # Small penalty for selling during pump (might be correct)
-                else:
-                    # Normal conditions - reward trading if signal is good
-                    if action != 0:  # BUY or SELL
-                        reward_bonus += 0.005  # Small bonus for trading in normal conditions
-            
-        except Exception as e:
-            # If error, don't add any bonus/penalty
-            self.logger.debug(f"Error calculating human strategy reward: {e}")
-        
-        return reward_bonus
-    
-    def _log_summary(self):
-        """Log summary of stop losses and take profits instead of individual events"""
-        if self.stop_loss_count > 0 or self.take_profit_count > 0:
-            summary_parts = []
-            
-            if self.stop_loss_count > 0:
-                avg_loss = sum(self.stop_loss_returns) / len(self.stop_loss_returns)
-                min_loss = min(self.stop_loss_returns)
-                max_loss = max(self.stop_loss_returns)
-                summary_parts.append(
-                    f"Stop Losses: {self.stop_loss_count} | "
-                    f"Avg: {avg_loss:.2%} | Min: {min_loss:.2%} | Max: {max_loss:.2%}"
-                )
-            
-            if self.take_profit_count > 0:
-                avg_profit = sum(self.take_profit_returns) / len(self.take_profit_returns)
-                min_profit = min(self.take_profit_returns)
-                max_profit = max(self.take_profit_returns)
-                summary_parts.append(
-                    f"Take Profits: {self.take_profit_count} | "
-                    f"Avg: {avg_profit:.2%} | Min: {min_profit:.2%} | Max: {max_profit:.2%}"
-                )
-            
-            if summary_parts:
-                self.logger.info(f"Risk Events Summary (last {self.summary_interval} steps): {' | '.join(summary_parts)}")
-            
-            # Reset counters for next interval
-            self.stop_loss_count = 0
-            self.stop_loss_returns = []
-            self.take_profit_count = 0
-            self.take_profit_returns = []
+        return window.flatten().astype(np.float32)
 
     def _check_entry_filters(self, current_price: float, rsi: float) -> Tuple[bool, str]:
         """Check if entry conditions are met"""
@@ -928,12 +714,6 @@ class StockTradingEnv(gym.Env):
 
             reward = 0
             done = False
-            
-            # Human-like strategy reward shaping
-            human_reward_bonus = 0.0
-            if self.use_human_strategies:
-                human_reward_bonus = self._calculate_human_strategy_reward(action)
-                reward += human_reward_bonus
 
             # Action logic with improved error handling and entry filters
             if action == 1:  # BUY
@@ -1000,10 +780,7 @@ class StockTradingEnv(gym.Env):
                     self.entry_price = 0.0
                     # Reward based on actual loss (scaled to percentage)
                     reward = (profit_dollars / cost_basis) * 100 if cost_basis > 0 else -10.0
-                    
-                    # Track statistics instead of logging each one
-                    self.stop_loss_count += 1
-                    self.stop_loss_returns.append(current_return)
+                    self.logger.warning(f"Stop loss triggered at {current_return:.2%}")
 
                 # Take profit
                 elif current_return > self.config.take_profit_pct:
@@ -1016,10 +793,7 @@ class StockTradingEnv(gym.Env):
                     self.entry_price = 0.0
                     # Reward based on actual profit (scaled to percentage)
                     reward = (profit_dollars / cost_basis) * 100 if cost_basis > 0 else 20.0
-                    
-                    # Track statistics instead of logging each one
-                    self.take_profit_count += 1
-                    self.take_profit_returns.append(current_return)
+                    self.logger.info(f"Take profit triggered at {current_return:.2%}")
 
                 else:
                     # Improved reward shaping - make it proportional to unrealized P&L
@@ -1044,16 +818,8 @@ class StockTradingEnv(gym.Env):
                         reward -= 0.1  # Small penalty to encourage selling
 
             self.current_step += 1
-            self.step_count += 1
-            
-            # Log summary periodically instead of every event
-            if self.step_count % self.summary_interval == 0:
-                self._log_summary()
-            
             if self.current_step >= self.max_steps:
                 done = True
-                # Log final summary
-                self._log_summary()
 
             return self._get_observation(), reward, done, False, {}
 

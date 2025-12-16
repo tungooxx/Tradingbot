@@ -72,18 +72,18 @@ def get_prediction(ticker="ETH-USD", mode="crypto", interval="1h", model_path=No
         # 1. Fetch Data using yfinance with appropriate interval
         print(f"📥 Fetching data for {ticker}...")
         if mode == "crypto":
-            # For crypto: use intraday data
-            # For 1h: yfinance allows up to 730 days (max), gives ~17,520 bars
-            period = "730d" if interval == "1h" else "120d"
+            # For crypto: fetch enough data for rolling normalization
+            # Need at least 1 year for rolling window, but yfinance allows up to 730 days for 1h
+            period = "730d" if interval == "1h" else "120d"  # Match training data period
             df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         else:
-            # For stocks: use interval from parameter (can be "1h", "1d", etc.)
-            stock_interval = interval if interval else "1d"
-            if stock_interval == "1h":
-                period = "2y"  # For hourly: request 2 years (more data than daily!)
+            # For stocks: fetch enough data for rolling normalization
+            # Need at least 1 year (252 trading days) for rolling window
+            if interval == "1h":
+                period = "2y"  # For hourly: request 2 years (yfinance allows up to 730 days)
             else:
-                period = "6mo"  # For daily: request 6 months
-            df = yf.download(ticker, period=period, interval=stock_interval, progress=False, auto_adjust=True)
+                period = "2y"  # For daily: request 2 years to ensure enough data
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
 
         if df.empty:
             raise ValueError(f"No data downloaded for {ticker}")
@@ -113,9 +113,21 @@ def get_prediction(ticker="ETH-USD", mode="crypto", interval="1h", model_path=No
         df.ta.macd(fast=12, slow=26, signal=9, append=True)
         df.dropna(inplace=True)
 
-        # Normalize
+        # Normalize (must match training normalization method)
         df["RSI_14"] = df["RSI_14"] / 100.0
-        df["MACD_12_26_9"] = (df["MACD_12_26_9"] - df["MACD_12_26_9"].mean()) / (df["MACD_12_26_9"].std() + 1e-7)
+        
+        # Use rolling normalization for MACD to match training (prevents distribution shift)
+        if interval == "1h":
+            rolling_window = 252 * 24  # ~1 year of hourly data
+        elif interval == "4h":
+            rolling_window = 252 * 6  # ~1 year of 4h data
+        else:  # daily
+            rolling_window = 252  # ~1 year of daily data
+        
+        # Use rolling mean/std for normalization (matches training method)
+        macd_mean = df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).mean()
+        macd_std = df["MACD_12_26_9"].rolling(rolling_window, min_periods=1).std()
+        df["MACD_12_26_9"] = (df["MACD_12_26_9"] - macd_mean) / (macd_std + 1e-7)
 
         features = ["Close", "Log_Ret", "Vol_Norm", "RSI_14", "MACD_12_26_9"]
 
