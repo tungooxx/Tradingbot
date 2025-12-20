@@ -481,3 +481,4 @@ if __name__ == "__main__":
         checkpoint_interval=args.checkpoint_interval,
         data_update_interval=args.data_update_interval
     )
+

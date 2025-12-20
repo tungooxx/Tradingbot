@@ -728,7 +728,7 @@ class StockTradingEnv(gym.Env):
         # 🛑 CRITICAL FIX: TIGHTER CLIPPING
         # Clip to [-1, 1]. This keeps gradients stable.
         # ============================================================
-        reward = np.clip(reward, -1.0, 1.0)
+        reward = np.clip(reward, -10.0, 10.0)
 
         self.current_step += 1
         if self.current_step >= self.max_steps:

@@ -100,6 +100,8 @@ class AlpacaPaperTradingBot:
         # Trading state
         self.last_signal_time = None
         self.signals_history = []
+        self.entry_step = {}  # Track entry step for each ticker (for time_in_trade calculation)
+        self.current_step = 0  # Track current step (for time_in_trade calculation)
         
         # Market hours (for stocks only, crypto is 24/7)
         self.market_timezone = pytz.timezone('US/Eastern')  # US market hours
@@ -264,23 +266,57 @@ class AlpacaPaperTradingBot:
                 has_position = 1.0 if self.ticker in positions else 0.0
                 no_position = 1.0 if self.ticker not in positions else 0.0
                 
-                # Get entry price if we have a position
+                # Get entry price and current price if we have a position
+                shares = 0.0
+                entry_price = 0.0
+                current_price = float(close_prices[-1])
+                
                 if self.ticker in positions:
-                    entry_price = positions[self.ticker]['avg_entry_price']
-                    current_price = float(close_prices[-1])
+                    position = positions[self.ticker]
+                    shares = float(position.get('qty', 0))
+                    entry_price = float(position.get('avg_entry_price', 0))
                     price_ratio = current_price / entry_price if entry_price > 0 else 1.0
                 else:
                     price_ratio = 1.0
                 
                 strategy_features = torch.tensor([[has_position, no_position, price_ratio]], dtype=torch.float32).to(device)
                 
-                exec_action, _, _ = execution_agent.act(features_dict, strategy_features, deterministic=True)
+                # HYBRID INPUT: Calculate precision features (hourly_return, rsi, position_status, unrealized_pnl)
+                precision_feat = execution_agent._get_precision_features(
+                    features_dict, shares, entry_price, current_price
+                ).unsqueeze(0).to(device)
+                
+                # HYBRID INPUT: Calculate local features (position_status, unrealized_pnl, time_in_trade, relative_price)
+                local_feat = self._calculate_local_features(
+                    shares, entry_price, current_price, close_prices, self.window_size
+                ).to(device)
+                
+                exec_action, _, _ = execution_agent.act(
+                    features_dict, strategy_features, precision_feat, local_feat, deterministic=True
+                )
             
-            # Get current price
-            current_price = float(close_prices[-1])
+            # CRITICAL: Check if action masking worked correctly
+            # Get actual position status to verify action is valid
+            positions = self.client.get_positions()
+            has_position = self.ticker in positions
+            
+            # Check if action is invalid (action masking should have prevented this)
+            action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
+            intended_action_name = action_map.get(exec_action, 'HOLD')
+            
+            # Validate action against actual position
+            if exec_action == 1 and has_position:  # BUY when already in position
+                logger.warning(f"Action mismatch! Intended: {intended_action_name}, but already have position")
+                logger.warning(f"    Invalid action (action masking should prevent this)")
+                logger.warning(f"    Position status from local_feat: {local_feat[0, 0].item():.2f} (should be 1.0)")
+                logger.warning(f"    Actual position: {has_position} (ticker in positions)")
+            elif exec_action == 2 and not has_position:  # SELL when no position
+                logger.warning(f"Action mismatch! Intended: {intended_action_name}, but no position to sell")
+                logger.warning(f"    Invalid action (action masking should prevent this)")
+                logger.warning(f"    Position status from local_feat: {local_feat[0, 0].item():.2f} (should be 0.0)")
+                logger.warning(f"    Actual position: {has_position} (ticker not in positions)")
             
             # Map action to signal
-            action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
             signal = action_map.get(exec_action, 'HOLD')
             
             # Get confidence (from meta agent)
@@ -300,6 +336,59 @@ class AlpacaPaperTradingBot:
         except Exception as e:
             logger.error(f"Error getting signal: {e}", exc_info=True)
             return None
+    
+    def _calculate_local_features(self, shares: float, entry_price: float, current_price: float,
+                                  close_prices: np.ndarray, window_size: int) -> torch.Tensor:
+        """
+        Calculate 4 normalized 'Local Features' for Hybrid Input architecture.
+        
+        Args:
+            shares: Current position size (0 if no position)
+            entry_price: Entry price of position (0 if no position)
+            current_price: Current market price
+            close_prices: Array of recent close prices (for MA calculation)
+            window_size: Window size for normalization
+        
+        Returns:
+            Local features tensor (1, 4): [position_status, unrealized_pnl, time_in_trade, relative_price]
+        """
+        # 1. Position Status: 0 if no position, 1 if holding
+        position_status = 1.0 if shares > 0 else 0.0
+        
+        # 2. Unrealized PnL: (Current price / Entry price - 1) scaled by 10
+        if shares > 0 and entry_price > 0:
+            unrealized_pnl = ((current_price / entry_price) - 1.0) * 10.0
+            # Normalize to [-1, 1] range
+            unrealized_pnl = np.clip(unrealized_pnl, -1.0, 1.0)
+        else:
+            unrealized_pnl = 0.0
+        
+        # 3. Time in Trade: Number of steps since last buy, normalized by window size
+        # For paper trading, we track entry step in self.entry_step dict
+        if shares > 0 and self.ticker in self.entry_step:
+            entry_step = self.entry_step[self.ticker]
+            time_in_trade = (self.current_step - entry_step) / float(window_size)
+            # Normalize to [0, 1] range
+            time_in_trade = np.clip(time_in_trade, 0.0, 1.0)
+        else:
+            time_in_trade = 0.0
+        
+        # 4. Relative Price: Current close relative to 20-period Moving Average
+        if len(close_prices) >= 20:
+            # Calculate 20-period MA
+            ma_window = close_prices[-20:]
+            ma_20 = np.mean(ma_window)
+            if ma_20 > 0:
+                relative_price = (current_price / ma_20) - 1.0
+                # Normalize to [-1, 1] range (scale by 5 to make it more sensitive)
+                relative_price = np.clip(relative_price * 5.0, -1.0, 1.0)
+            else:
+                relative_price = 0.0
+        else:
+            relative_price = 0.0
+        
+        return torch.tensor([[position_status, unrealized_pnl, time_in_trade, relative_price]], 
+                           dtype=torch.float32)
     
     def calculate_position_size(self, price: float) -> float:
         """Calculate position size based on buying power"""
@@ -409,6 +498,9 @@ class AlpacaPaperTradingBot:
                     order_type='market'
                 )
                 
+                # HYBRID INPUT: Track entry step for time_in_trade calculation
+                self.entry_step[self.ticker] = self.current_step
+                
                 logger.info(f"Order placed: {order['id']} - Status: {order['status']}")
                 return True
             
@@ -433,6 +525,10 @@ class AlpacaPaperTradingBot:
                     order_type='market'
                 )
                 
+                # HYBRID INPUT: Clear entry step when position is closed
+                if self.ticker in self.entry_step:
+                    del self.entry_step[self.ticker]
+                
                 # Calculate P&L
                 entry_price = position['avg_entry_price']
                 pnl = (price - entry_price) * shares
@@ -451,6 +547,9 @@ class AlpacaPaperTradingBot:
         """Run one trading cycle"""
         try:
             logger.info(f"Getting signal for {self.ticker}...")
+            
+            # HYBRID INPUT: Increment current step for time_in_trade calculation
+            self.current_step += 1
             
             # Get signal
             signal = self.get_trading_signal()
@@ -618,3 +717,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+

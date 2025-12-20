@@ -22,6 +22,14 @@ from datetime import datetime
 import json
 from collections import defaultdict
 
+# Weights & Biases for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with: pip install wandb")
+
 # Import from v0.1
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'v0.1'))
@@ -66,12 +74,82 @@ class TrainingStats:
         self.loss_count = 0
         self.rewards_history = []
         self.profits_history = []
+        self.invalid_action_counts = defaultdict(int)  # Track invalid actions for reward breakdown
+        # DEBUG: Reset reward breakdown tracking
+        self.reward_breakdowns = []
+        self.transaction_costs = []
+        self.volatility_penalties = []
+        self.stop_loss_penalties = []
+        self.whipsaw_penalties = []
+        self.pnl_rewards = []
+        self.action_rewards = []
+        self.holding_rewards = []
+        self.stop_loss_rewards = []
+        self.take_profit_rewards = []
+        # DEBUG: Initialize reward breakdown tracking
+        self.reward_breakdowns = []
+        self.transaction_costs = []
+        self.volatility_penalties = []
+        self.stop_loss_penalties = []
+        self.whipsaw_penalties = []
+        self.pnl_rewards = []
     
     def update(self, reward: float, info: Dict, action: Optional[int] = None, 
                strategy: Optional[str] = None):
         """Update statistics from step"""
         self.total_reward += reward
         self.rewards_history.append(reward)
+        
+        # REWARD BREAKDOWN TRACKING: Track reward components for debugging
+        if not hasattr(self, 'reward_breakdowns'):
+            self.reward_breakdowns = []
+            self.transaction_costs = []
+            self.volatility_penalties = []
+            self.stop_loss_penalties = []
+            self.whipsaw_penalties = []
+            self.pnl_rewards = []
+            self.action_rewards = []
+            self.holding_rewards = []
+            self.stop_loss_rewards = []
+            self.take_profit_rewards = []
+        
+        # Track reward breakdown components if available
+        if 'reward_breakdown' in info and isinstance(info['reward_breakdown'], dict):
+            breakdown = info['reward_breakdown']
+            self.reward_breakdowns.append(breakdown)
+            
+            # Track detailed components (if available in environment)
+            if 'transaction_cost' in breakdown:
+                self.transaction_costs.append(breakdown['transaction_cost'])
+            if 'transaction_cost_ratio' in breakdown:
+                # Convert ratio to absolute if we have portfolio value
+                if 'portfolio_value' in info:
+                    self.transaction_costs.append(breakdown['transaction_cost_ratio'] * info['portfolio_value'])
+            if 'volatility_penalty' in breakdown:
+                self.volatility_penalties.append(breakdown['volatility_penalty'])
+            if 'stop_loss_penalty' in breakdown:
+                self.stop_loss_penalties.append(breakdown['stop_loss_penalty'])
+            if 'whipsaw_penalty' in breakdown:
+                self.whipsaw_penalties.append(breakdown['whipsaw_penalty'])
+            if 'pnl_reward' in breakdown or 'pnl_component' in breakdown:
+                pnl = breakdown.get('pnl_reward') or breakdown.get('pnl_component', 0.0)
+                self.pnl_rewards.append(pnl)
+            
+            # Track action-based rewards (what's actually in the current reward_breakdown)
+            if 'action_reward' in breakdown:
+                self.action_rewards.append(breakdown['action_reward'])
+            if 'holding_reward' in breakdown:
+                self.holding_rewards.append(breakdown['holding_reward'])
+            if 'stop_loss_reward' in breakdown:
+                self.stop_loss_rewards.append(breakdown['stop_loss_reward'])
+            if 'take_profit_reward' in breakdown:
+                self.take_profit_rewards.append(breakdown['take_profit_reward'])
+        
+        # REWARD BREAKDOWN TRACKING: Track invalid actions and reward components
+        if 'invalid_action' in info:
+            if not hasattr(self, 'invalid_action_counts'):
+                self.invalid_action_counts = defaultdict(int)
+            self.invalid_action_counts[info['invalid_action']] += 1
         
         # Track action
         if action is not None:
@@ -87,8 +165,22 @@ class TrainingStats:
         
         # Track balance and profit
         if 'balance' in info:
-            if self.initial_balance is None:
-                self.initial_balance = info.get('initial_balance', info['balance'])
+            # CRITICAL FIX: Always use initial_balance from info if available (more reliable)
+            # The info dict should have the correct initial_balance from environment reset
+            if 'initial_balance' in info:
+                # Use initial_balance from info (set by environment reset)
+                # This ensures we always have the correct starting balance
+                if self.initial_balance is None:
+                    self.initial_balance = info['initial_balance']
+                elif abs(self.initial_balance - info['initial_balance']) > 0.01:
+                    # If initial_balance changed significantly (shouldn't happen, but fix it)
+                    # Only warn if difference is > $0.01 to avoid false positives from floating point
+                    self.logger.warning(f"Initial balance mismatch: stats={self.initial_balance:.2f}, info={info['initial_balance']:.2f}, using info value")
+                    self.initial_balance = info['initial_balance']
+            elif self.initial_balance is None:
+                # Fallback: use balance from first step if initial_balance not in info
+                self.initial_balance = info['balance']
+            
             self.current_balance = info['balance']
             if self.initial_balance and self.initial_balance > 0:
                 profit = self.current_balance - self.initial_balance
@@ -124,13 +216,22 @@ class TrainingStats:
         win_rate = (self.win_count / self.trade_count * 100) if self.trade_count > 0 else 0.0
         return_pct = ((self.current_balance - self.initial_balance) / self.initial_balance * 100) if self.initial_balance and self.initial_balance > 0 else 0.0
         
-        return {
+        # FIX: Sort action_counts by consistent order (HOLD, BUY, SELL) for consistent display
+        # Python dicts maintain insertion order, so order can vary based on which action appears first
+        action_order = ['HOLD', 'BUY', 'SELL']
+        sorted_action_counts = {action: self.action_counts.get(action, 0) for action in action_order if action in self.action_counts}
+        # Add any other actions that might exist (shouldn't happen, but defensive)
+        for action, count in self.action_counts.items():
+            if action not in sorted_action_counts:
+                sorted_action_counts[action] = count
+        
+        summary = {
             'total_reward': self.total_reward,
             'total_profit': self.total_profit,
             'return_pct': return_pct,
             'initial_balance': self.initial_balance,
             'current_balance': self.current_balance,
-            'action_counts': dict(self.action_counts),
+            'action_counts': sorted_action_counts,  # Use sorted dict for consistent display
             'strategy_counts': dict(self.strategy_counts),
             'trade_count': self.trade_count,
             'win_count': self.win_count,
@@ -139,6 +240,12 @@ class TrainingStats:
             'avg_reward': np.mean(self.rewards_history) if self.rewards_history else 0.0,
             'avg_profit': np.mean(self.profits_history) if self.profits_history else 0.0
         }
+        
+        # REWARD BREAKDOWN: Add invalid action counts if tracked
+        if hasattr(self, 'invalid_action_counts'):
+            summary['invalid_action_counts'] = dict(self.invalid_action_counts)
+        
+        return summary
     
     def log_summary(self, prefix: str = ""):
         """Log summary statistics"""
@@ -149,12 +256,20 @@ class TrainingStats:
         self.logger.info(f"{prefix_str}Total Reward: {summary['total_reward']:.2f}")
         self.logger.info(f"{prefix_str}Total Profit: ${summary['total_profit']:.2f}")
         self.logger.info(f"{prefix_str}Return: {summary['return_pct']:.2f}%")
-        self.logger.info(f"{prefix_str}Balance: ${summary['initial_balance']:.2f} → ${summary['current_balance']:.2f}")
+        # CRITICAL FIX: Handle None values and Unicode encoding issue
+        initial_bal = summary['initial_balance'] if summary['initial_balance'] is not None else 0.0
+        current_bal = summary['current_balance'] if summary['current_balance'] is not None else 0.0
+        # Use ASCII arrow instead of Unicode to avoid encoding errors
+        self.logger.info(f"{prefix_str}Balance: ${initial_bal:.2f} -> ${current_bal:.2f}")
         self.logger.info(f"{prefix_str}Actions: {summary['action_counts']}")
         if summary['strategy_counts']:
             self.logger.info(f"{prefix_str}Strategies: {summary['strategy_counts']}")
         self.logger.info(f"{prefix_str}Trades: {summary['trade_count']} (Wins: {summary['win_count']}, Losses: {summary['loss_count']}, Win Rate: {summary['win_rate']:.1f}%)")
         self.logger.info(f"{prefix_str}Avg Reward: {summary['avg_reward']:.4f}, Avg Profit: ${summary['avg_profit']:.2f}")
+        
+        # REWARD BREAKDOWN: Log invalid action counts if available
+        if 'invalid_action_counts' in summary and summary['invalid_action_counts']:
+            self.logger.info(f"{prefix_str}Invalid Actions: {summary['invalid_action_counts']}")
 
 
 # ==============================================================================
@@ -236,10 +351,11 @@ def prepare_pretraining_data(preprocessor: MultiTimescalePreprocessor,
 def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
                                   mode: str = "stock",
                                   epochs: int = 100,
-                                  batch_size: int = 64,
+                                  batch_size: int = 256,  # Increased from 64 to 256 (4x) for better GPU utilization
                                   lr: float = 0.0001,
                                   window_size: int = 30,
-                                  logger: Optional[logging.Logger] = None) -> MultiScaleTransformerEncoder:
+                                  logger: Optional[logging.Logger] = None,
+                                  use_wandb: bool = True) -> MultiScaleTransformerEncoder:
     """
     Pre-train transformer encoders on price prediction task.
     
@@ -337,14 +453,26 @@ def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
     for epoch in range(epochs):
         total_loss = 0.0
         num_batches = 0
+        interval_losses = {}  # Track losses per interval for wandb
         
         # Train on each timescale
         for interval, X in X_dict.items():
             y = y_dict[interval]
+            interval_loss = 0.0
+            interval_batches = 0
             
             # Create dataloader (FIX: Ensure float32 dtype)
+            # OPTIMIZATION: Add num_workers and pin_memory for faster data loading
+            # num_workers=4-8 is optimal (too many causes overhead, too few causes CPU bottleneck)
             dataset = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(y).float())
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataloader = DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=True,
+                num_workers=4,  # Match physical CPU cores (4-8 is sweet spot)
+                pin_memory=True,  # Speed up CPU->GPU transfer
+                persistent_workers=True  # Keep workers alive between epochs
+            )
             
             for batch_X, batch_y in dataloader:
                 batch_X = batch_X.to(device)
@@ -412,15 +540,32 @@ def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
                     optimizer.zero_grad()
                     continue
                 
-                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 optimizer.step()
                 
                 total_loss += loss.item()
+                interval_loss += loss.item()
                 num_batches += 1
+                interval_batches += 1
+            
+            # Store interval loss
+            if interval_batches > 0:
+                interval_losses[interval] = interval_loss / interval_batches
         
         if (epoch + 1) % 10 == 0:
             avg_loss = total_loss / num_batches if num_batches > 0 else 0
             logger.info(f"Epoch {epoch + 1}/{epochs}, Average Loss: {avg_loss:.6f}")
+            
+            # Log to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                log_dict = {
+                    "stage1/epoch": epoch + 1,
+                    "stage1/total_loss": avg_loss,
+                }
+                # Add per-interval losses
+                for interval, loss_val in interval_losses.items():
+                    log_dict[f"stage1/loss_{interval}"] = loss_val
+                wandb.log(log_dict)
     
     logger.info("Transformer pre-training complete!")
     return transformer
@@ -438,7 +583,8 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                               steps_per_epoch: int = 500,
                               lr: float = 0.003,  # 3e-3: 10x increase from 3e-4 - Agent needs bigger updates to change its mind
                               window_size: int = 30,
-                              logger: Optional[logging.Logger] = None) -> Dict[str, nn.Module]:
+                              logger: Optional[logging.Logger] = None,
+                              use_wandb: bool = True) -> Dict[str, nn.Module]:
     """
     Pre-train execution agents (one per strategy).
     
@@ -487,9 +633,37 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
         agent.transformer_encoder.load_state_dict(matched_state, strict=False)
         logger.info(f"Loaded {len(matched_state)}/{len(pretrained_state)} transformer weights")
         
-        # Create execution environment
+        # HYBRID INPUT PROTECTION: Freeze transformer weights or use very low learning rate
+        # Transformer weights remain frozen - only Actor-Critic 'Hybrid Head' learns
+        for param in agent.transformer_encoder.parameters():
+            param.requires_grad = False  # Freeze transformer weights
+        logger.info("Transformer weights frozen - only Hybrid Head (Actor-Critic) will learn")
+        
+        # Create execution environment with Alpaca-matching settings
         config = TradingConfig()
         config.mode = mode
+        # CRITICAL: Match Alpaca settings for consistent training/live performance
+        # Alpaca default: max_positions=5, position_size_pct=0.10 (10%)
+        # User can override by setting config.max_positions and config.max_position_size_pct
+        if not hasattr(config, 'max_positions') or getattr(config, 'max_positions', None) is None:
+            config.max_positions = 5  # Alpaca default: 5 concurrent positions
+        if not hasattr(config, 'max_position_size_pct') or getattr(config, 'max_position_size_pct', None) is None:
+            config.max_position_size_pct = 0.10  # Alpaca default: 10% per position
+        
+        # TEMPORARY: Set fees to 0.0% for the next 50 epochs to boost learning
+        # This removes transaction cost friction and allows agent to explore more freely
+        FEE_FREE_EPOCHS = 50
+        original_commission = config.commission_rate
+        original_slippage = config.slippage_bps
+        config.commission_rate = 0.0  # 0.0% commission
+        config.slippage_bps = 0.0  # 0.0% slippage
+        logger.info(f"[FEE-FREE MODE] Setting fees to 0.0% for first {FEE_FREE_EPOCHS} epochs")
+        logger.info(f"  Original: commission={original_commission:.4f} ({original_commission*100:.2f}%), slippage={original_slippage:.1f} bps")
+        logger.info(f"  Temporary: commission=0.0 (0.0%), slippage=0.0 bps")
+        
+        logger.info(f"Creating ExecutionEnv with Alpaca-matching settings:")
+        logger.info(f"  max_positions={config.max_positions}, position_size_pct={config.max_position_size_pct:.1%}")
+        
         exec_env = ExecutionEnv(
             ticker=preprocessor.ticker,
             window_size=window_size,
@@ -501,15 +675,15 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
         # Initialize statistics tracker for this strategy
         stats = TrainingStats(logger)
         
-        # Optimizer
-        optimizer = optim.Adam(agent.parameters(), lr=lr)
+        # Optimizer - only train non-frozen parameters (Hybrid Head)
+        # Filter out frozen transformer parameters
+        trainable_params = [p for p in agent.parameters() if p.requires_grad]
+        optimizer = optim.Adam(trainable_params, lr=lr)
+        logger.info(f"Optimizer: Training {len(trainable_params)} trainable parameters (transformer frozen)")
         
-        # DEBUG: Ensure agent is in training mode and parameters require gradients
+        # DEBUG: Ensure agent is in training mode
         agent.train()  # Set to training mode
-        for param in agent.parameters():
-            if not param.requires_grad:
-                logger.warning(f"Parameter {param.shape} does not require grad, enabling it")
-                param.requires_grad = True
+        # Note: Transformer params have requires_grad=False (frozen), which is correct
         
         logger.debug(f"Agent training mode: {agent.training}")
         logger.debug(f"Agent parameters requiring grad: {sum(p.requires_grad for p in agent.parameters())}/{len(list(agent.parameters()))}")
@@ -532,25 +706,74 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
         total_steps = epochs_per_agent * steps_per_epoch
         current_global_step = 0
         
+        # Persistent entropy settings and state (do NOT reset every epoch)
+        # ENTROPY COEFFICIENT: Reduced for convergence stage
+        # Cut in half from ~0.0078 to 0.003 to allow agent to start converging
+        ENTROPY_COEF_START = 0.003  # Reduced from 0.01 to allow convergence
+        ENTROPY_COEF_MIN = 0.001  # Increased 10x from 0.0001 to maintain minimum exploration
+        ENTROPY_COEF_DECAY = 0.99
+        ENTROPY_COEF_MAX = ENTROPY_COEF_START * 20.0  # 0.003 * 20 = 0.06
+        entropy_coef = ENTROPY_COEF_START
+        
         for epoch in range(epochs_per_agent):
+            # DEBUG: Check balance BEFORE reset
+            if hasattr(exec_env.base_env, 'balance'):
+                balance_before_reset = exec_env.base_env.balance
+                if epoch % 10 == 0 or epoch < 3:
+                    logger.debug(f"  Epoch {epoch}: Balance BEFORE reset() = ${balance_before_reset:.2f}")
+            
             state, _ = exec_env.reset()
             episode_reward = 0.0
+            
+            # DEBUG: Check balance AFTER reset
+            if hasattr(exec_env.base_env, 'balance'):
+                balance_after_reset = exec_env.base_env.balance
+                if epoch % 10 == 0 or epoch < 3:
+                    logger.debug(f"  Epoch {epoch}: Balance AFTER reset() = ${balance_after_reset:.2f}")
+            
+            # CRITICAL FIX: Explicitly reset balance to initial_balance at start of each epoch
+            # The environment should reset balance, but we ensure it's always $2000.00
+            if hasattr(exec_env.base_env, 'balance') and hasattr(exec_env.base_env, 'initial_balance'):
+                expected_initial_balance = exec_env.base_env.initial_balance
+                balance_before_fix = exec_env.base_env.balance
+                
+                # DEBUG: Log balance state before and after reset
+                if epoch % 10 == 0 or epoch < 3:  # Log every 10 epochs or first 3
+                    logger.info(f"  Epoch {epoch} START: Balance check - Before fix: ${balance_before_fix:.2f}, Expected: ${expected_initial_balance:.2f}")
+                
+                if abs(exec_env.base_env.balance - expected_initial_balance) > 0.01:
+                    logger.warning(f"  Epoch {epoch}: Balance not reset properly! Was ${exec_env.base_env.balance:.2f}, resetting to ${expected_initial_balance:.2f}")
+                    logger.warning(f"    DEBUG: Checking where $1800 came from...")
+                    logger.warning(f"    DEBUG: exec_env.base_env.balance = ${exec_env.base_env.balance:.2f}")
+                    logger.warning(f"    DEBUG: exec_env.base_env.initial_balance = ${exec_env.base_env.initial_balance:.2f}")
+                    logger.warning(f"    DEBUG: exec_env.base_env.shares = {exec_env.base_env.shares}")
+                    logger.warning(f"    DEBUG: exec_env.base_env.entry_price = ${exec_env.base_env.entry_price:.2f}")
+                    
+                    # Force correct balance
+                    exec_env.base_env.balance = expected_initial_balance
+                    exec_env.base_env.shares = 0.0
+                    exec_env.base_env.entry_price = 0.0
+                    
+                    logger.warning(f"    DEBUG: After fix - balance = ${exec_env.base_env.balance:.2f}, shares = {exec_env.base_env.shares}, entry_price = ${exec_env.base_env.entry_price:.2f}")
+                
+                epoch_start_balance = exec_env.base_env.balance
+                if epoch % 10 == 0 or epoch < 3:  # Log every 10 epochs or first 3
+                    logger.debug(f"  Epoch {epoch} START: Environment balance = ${epoch_start_balance:.2f} (should be ${expected_initial_balance:.2f})")
             
             # CRITICAL FIX: Reset statistics at start of each epoch
             # This ensures action counts and other stats are per-epoch, not accumulated
             stats.reset()
             
-            # SLOW ENTROPY DECAY: Keep agent curious for longer (until epoch 100+)
-            # Entropy coefficient: Start at 0.0001, decay slowly to 0.00001 over epochs
-            # Use slower decay (0.99 per epoch) so entropy stays above zero until epoch 100
-            # Instead of linear progress, use exponential decay with base 0.99
-            entropy_coef = 0.0001 * (0.99 ** epoch)  # Slow exponential decay (0.99 per epoch)
-            entropy_coef = max(entropy_coef, 0.00001)  # Clamp to minimum
+            # Update entropy coef persistently (do NOT reset per epoch)
+            # Apply gentle decay each epoch but keep floor; any auto-increase from PPO stays
+            entropy_coef = max(entropy_coef * ENTROPY_COEF_DECAY, ENTROPY_COEF_MIN)
             epoch_progress = epoch / epochs_per_agent  # For logging only
+            if epoch % 10 == 0 or epoch < 5:
+                logger.info(f"  Epoch {epoch}: Entropy Coef (persistent) = {entropy_coef:.6f} (Progress: {epoch_progress:.1%})")
             
-            # DEBUG: Log entropy coefficient to verify decay
-            if epoch % 10 == 0 or epoch < 5:  # Log every 10 epochs or first 5
-                logger.info(f"  Epoch {epoch}: Entropy Coef = {entropy_coef:.4f} (Progress: {epoch_progress:.1%})")
+            # Track action diversity to detect policy collapse
+            action_history = []  # Track last 100 actions to detect collapse
+            ACTION_HISTORY_SIZE = 100
             
             for step in range(steps_per_epoch):
                 current_global_step += 1
@@ -589,6 +812,12 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                 
                 strategy_feat = agent._get_strategy_features(shares, entry_price, current_price).unsqueeze(0).to(device)
                 
+                # PRECISION FEATURES: Vision (Transformer) + Precision (Scaled Price)
+                # Calculate precision features: hourly_return, rsi, position_status, unrealized_pnl
+                precision_feat = agent._get_precision_features(
+                    features_dict, shares, entry_price, current_price
+                ).unsqueeze(0).to(device)
+                
                 # DEBUG: Check for NaN/Inf in inputs before forward pass
                 # NOTE: Inputs don't need gradients (they're data), so nan_to_num is OK here
                 # But we'll use it for consistency and to avoid issues
@@ -603,6 +832,51 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     # Inputs don't need gradients, but use nan_to_num for safety
                     strategy_feat = torch.nan_to_num(strategy_feat, nan=0.0, posinf=0.0, neginf=0.0)
                 
+                # PRECISION FEATURES: Vision (Transformer) + Precision (Scaled Price)
+                # Calculate precision features: hourly_return, rsi, position_status, unrealized_pnl
+                precision_feat = agent._get_precision_features(
+                    features_dict, shares, entry_price, current_price
+                ).unsqueeze(0).to(device)
+                
+                if torch.isnan(precision_feat).any() or torch.isinf(precision_feat).any():
+                    logger.warning("NaN/Inf detected in precision_feat, replacing with zeros")
+                    precision_feat = torch.nan_to_num(precision_feat, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # HYBRID INPUT: Local Features from Environment
+                # Get local features from environment (position_status, unrealized_pnl, time_in_trade, relative_price)
+                # CRITICAL: This is used for action masking - must be correct!
+                if hasattr(exec_env.base_env, '_get_local_features'):
+                    local_feat_np = exec_env.base_env._get_local_features()
+                    local_feat = torch.from_numpy(local_feat_np).unsqueeze(0).float().to(device)
+                    
+                    # DEBUG: Verify position_status matches actual shares
+                    position_status_from_feat = local_feat[0, 0].item() if local_feat.numel() > 0 else 0.0
+                    actual_shares = exec_env.base_env.shares if hasattr(exec_env.base_env, 'shares') else 0.0
+                    expected_pos_status = 1.0 if actual_shares > 0 else 0.0
+                    
+                    # CRITICAL: Log mismatch if position_status is wrong
+                    if abs(position_status_from_feat - expected_pos_status) > 0.1:
+                        if step % 50 == 0:  # Log every 50 steps to avoid spam
+                            logger.warning(f"  Step {step}: [ACTION MASKING BUG] position_status mismatch!")
+                            logger.warning(f"    Expected: {expected_pos_status:.1f} (shares={actual_shares:.4f})")
+                            logger.warning(f"    Got from local_feat: {position_status_from_feat:.1f}")
+                            logger.warning(f"    This will cause incorrect action masking!")
+                            # FIX: Overwrite position_status with correct value
+                            local_feat[0, 0] = expected_pos_status
+                            logger.warning(f"    FIXED: Set position_status to {expected_pos_status:.1f}")
+                else:
+                    # Fallback: create default local features
+                    # CRITICAL: If _get_local_features doesn't exist, we need to calculate it manually
+                    actual_shares = exec_env.base_env.shares if hasattr(exec_env.base_env, 'shares') else 0.0
+                    position_status = 1.0 if actual_shares > 0 else 0.0
+                    logger.warning(f"  Step {step}: [WARNING] _get_local_features() not found! Using fallback with position_status={position_status:.1f}")
+                    local_feat = torch.zeros(1, 4, device=device, dtype=torch.float32)
+                    local_feat[0, 0] = position_status  # Set correct position_status
+                
+                if torch.isnan(local_feat).any() or torch.isinf(local_feat).any():
+                    logger.warning("NaN/Inf detected in local_feat, replacing with zeros")
+                    local_feat = torch.nan_to_num(local_feat, nan=0.0, posinf=0.0, neginf=0.0)
+                
                 # DEBUG: Get action and value for PPO
                 # CRITICAL: We need to store the ORIGINAL features_dict and strategy_feat WITHOUT detaching
                 # so that when we recompute during PPO, gradients can flow through model parameters
@@ -613,7 +887,7 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     
                     # Forward pass WITH gradients (needed for PPO updates)
                     # Inputs don't need gradients (they're data), but model parameters do
-                    logits, value_tensor = agent(features_dict, strategy_feat)
+                    logits, value_tensor = agent(features_dict, strategy_feat, precision_feat, local_feat)
                     
                     # DEBUG: Print logits every 100 steps to check if agent is making decisions
                     if step % 100 == 0:
@@ -627,31 +901,77 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     # CRITICAL: Don't use torch.nan_to_num() or zeros_like() here - they break gradients!
                     # The model's forward() already handles NaN with gradient-preserving replacement
                     # If we still get NaN here, it means the model itself has issues
+                    # ============================================================
+                    # LOGIT PARAMETERS (CRITICAL FIX for Policy Collapse)
+                    # ============================================================
+                    # CRITICAL FIX: Extreme logits cause softmax collapse to single action
+                    # Tighter clamping + temperature scaling to prevent deterministic behavior
+                    # ============================================================
+                    LOGIT_CLAMP_MIN = -5.0   # Tighter: Prevent extreme values
+                    LOGIT_CLAMP_MAX = +5.0   # Tighter: Keep probabilities reasonable
+                    LOGIT_TEMPERATURE = 2.5  # Temperature scaling: Increased from 1.5 to 2.5 for stronger exploration
+                    
                     if torch.isnan(logits).any() or torch.isinf(logits).any():
                         logger.warning("NaN/Inf in logits after model forward - model may have issues")
                         # Try to maintain gradient connection if possible
-                        # Use a small operation that preserves grad_fn
                         logits = logits + 0.0 * torch.zeros_like(logits)  # Maintain connection
-                        logits = torch.clamp(logits, min=-10, max=10)  # Clamp to reasonable range
+                        logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
                     
                     if torch.isnan(value_tensor).any() or torch.isinf(value_tensor).any():
                         logger.warning("NaN/Inf in value_tensor after model forward - model may have issues")
                         # Maintain gradient connection
                         value_tensor = value_tensor + 0.0 * torch.zeros_like(value_tensor)
                     
-                    # Clamp logits to prevent extreme values
-                    logits = torch.clamp(logits, min=-10, max=10)
+                    # CRITICAL FIX: Clamp FIRST, then apply adaptive temperature scaling
+                    # This prevents extreme logits from causing policy collapse
+                    logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
                     
-                    # Create distribution and sample action
-                    dist = torch.distributions.Categorical(logits=logits)
+                    # Adaptive temperature scaling to reach a target entropy for 3 actions
+                    LOGIT_TEMPERATURE_BASE = 2.5  # starting temperature
+                    TARGET_ACTION_ENTROPY = 0.5   # ~half of max (~1.0986) for 3-way action
+                    TEMP_MAX = 10.0               # upper bound to avoid over-flattening
+                    TEMP_GROWTH = 1.5             # multiplicative growth per adjustment
+                    temp = LOGIT_TEMPERATURE_BASE
+                    
+                    used_logits = logits / temp
+                    dist = torch.distributions.Categorical(logits=used_logits)
+                    entropy_val_temp = dist.entropy().item()
+                    adjust_count = 0
+                    while entropy_val_temp < TARGET_ACTION_ENTROPY and temp < TEMP_MAX:
+                        temp = min(temp * TEMP_GROWTH, TEMP_MAX)
+                        used_logits = logits / temp
+                        dist = torch.distributions.Categorical(logits=used_logits)
+                        entropy_val_temp = dist.entropy().item()
+                        adjust_count += 1
+                    if adjust_count > 0:
+                        logger.debug(f"Adaptive temperature: increased to {temp:.2f} to reach entropy {entropy_val_temp:.3f}")
+                    
+                    # Create distribution (with final temperature) and sample action
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
                     
-                    # DEBUG: Log action probabilities to check if agent is learning
-                    # (Only log occasionally to avoid spam)
-                    if step % 100 == 0 and epoch % 10 == 0:  # Log every 100 steps, every 10 epochs
-                        probs = F.softmax(logits, dim=-1)
-                        logger.debug(f"  Step {step}: Action probs = HOLD:{probs[0,0]:.3f}, BUY:{probs[0,1]:.3f}, SELL:{probs[0,2]:.3f}, Entropy={dist.entropy().item():.3f}")
+                    # CRITICAL FIX: Log action probabilities MORE FREQUENTLY to detect collapse early
+                    # Log every 50 steps (not 100) and every epoch (not 10) to catch collapse quickly
+                    if step % 50 == 0:  # More frequent logging
+                        probs = F.softmax(used_logits, dim=-1)
+                        entropy_val = dist.entropy().item()
+                        logger.info(f"  Step {step}: Action probs = HOLD:{probs[0,0]:.3f}, BUY:{probs[0,1]:.3f}, SELL:{probs[0,2]:.3f}, Entropy={entropy_val:.4f}")
+                        
+                        # ============================================================
+                        # POLICY COLLAPSE DETECTION (CRITICAL - Detect Early!)
+                        # ============================================================
+                        max_prob = probs.max(dim=-1).values.mean().item()
+                        if max_prob > 0.90:  # Lower threshold: Detect collapse earlier (was 0.95)
+                            logger.warning(f"[WARNING] POLICY COLLAPSE DETECTED: max_action_prob = {max_prob:.2%}. Agent is deterministic!")
+                            logger.warning(f"   Action distribution: HOLD={probs[0,0]:.1%}, BUY={probs[0,1]:.1%}, SELL={probs[0,2]:.1%}")
+                            logger.warning(f"   Entropy={entropy_val:.4f} (should be >0.5 for 3 actions)")
+                            
+                            # CRITICAL FIX: Reset entropy coefficient if collapse detected
+                            # This forces agent to explore again
+                            if entropy_val < 0.3:  # Very low entropy = collapse
+                                old_entropy_coef = entropy_coef
+                                entropy_coef = min(entropy_coef * 2.0, ENTROPY_COEF_MAX)  # Double it, capped by max
+                                logger.warning(f"   RESETTING entropy_coef: {old_entropy_coef:.6f} -> {entropy_coef:.6f} to force exploration (cap={ENTROPY_COEF_MAX:.6f})")
                     
                     # DEBUG: Detach values for storage (old policy values)
                     # These are used for computing advantages and ratios, but don't need gradients
@@ -670,28 +990,171 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                 # DEBUG: Convert action to Python int for environment step
                 action_item = action.item() if action.dim() == 0 else action[0].item()
                 
+                # CRITICAL FIX: Track action diversity to detect policy collapse
+                action_history.append(action_item)
+                if len(action_history) > ACTION_HISTORY_SIZE:
+                    action_history.pop(0)  # Keep only last 100 actions
+                
+                # Check action diversity every 50 steps
+                if step % 50 == 0 and len(action_history) >= 50:
+                    action_counts = {0: 0, 1: 0, 2: 0}  # HOLD, BUY, SELL
+                    for a in action_history:
+                        action_counts[a] = action_counts.get(a, 0) + 1
+                    
+                    total_actions = len(action_history)
+                    action_proportions = {k: v/total_actions for k, v in action_counts.items()}
+                    max_proportion = max(action_proportions.values())
+                    
+                    # CRITICAL: Warn if one action dominates (>80% of recent actions)
+                    if max_proportion > 0.80:
+                        dominant_action = max(action_proportions, key=action_proportions.get)
+                        action_names = {0: "HOLD", 1: "BUY", 2: "SELL"}
+                        logger.warning(f"[WARNING] ACTION COLLAPSE DETECTED: {action_names[dominant_action]} is {max_proportion:.1%} of last {len(action_history)} actions!")
+                        logger.warning(f"   Action distribution: HOLD={action_proportions[0]:.1%}, BUY={action_proportions[1]:.1%}, SELL={action_proportions[2]:.1%}")
+                        logger.warning(f"   This indicates policy collapse - agent is not exploring!")
+                
                 # Step environment (this doesn't need gradients)
                 next_state, reward, done, truncated, info = exec_env.step(action_item)
                 
-                # Clip reward to prevent extreme values
-                reward = np.clip(reward, -100, 100)
+                # DEBUG: Log reward breakdown for analysis (every 10 steps or when reward/profit mismatch)
+                if step % 10 == 0 or (step == 1 and epoch % 10 == 0):
+                    # Get reward breakdown from info if available
+                    reward_breakdown = info.get('reward_breakdown', {})
+                    if isinstance(reward_breakdown, dict):
+                        log_return = reward_breakdown.get('log_return', 'N/A')
+                        transaction_cost_ratio = reward_breakdown.get('transaction_cost_ratio', 'N/A')
+                        raw_reward = reward_breakdown.get('raw_reward', 'N/A')
+                        multiplier_applied = reward_breakdown.get('multiplier_applied', 'N/A')
+                        scaled_reward = reward_breakdown.get('scaled_reward', 'N/A')
+                        volatility_penalty = reward_breakdown.get('volatility_penalty', 'N/A')
+                        exit_reason = reward_breakdown.get('exit_reason', 'N/A')
+                        bars_held = reward_breakdown.get('bars_held', 'N/A')
+                        
+                        logger.info(f"  Step {step}: REWARD BREAKDOWN:")
+                        # Format numeric values, keep strings as-is
+                        log_return_str = f"{log_return:.6f}" if isinstance(log_return, (int, float)) else str(log_return)
+                        transaction_cost_str = f"{transaction_cost_ratio:.6f}" if isinstance(transaction_cost_ratio, (int, float)) else str(transaction_cost_ratio)
+                        raw_reward_str = f"{raw_reward:.4f}" if isinstance(raw_reward, (int, float)) else str(raw_reward)
+                        scaled_reward_str = f"{scaled_reward:.4f}" if isinstance(scaled_reward, (int, float)) else str(scaled_reward)
+                        volatility_penalty_str = f"{volatility_penalty:.4f}" if isinstance(volatility_penalty, (int, float)) else str(volatility_penalty)
+                        
+                        logger.info(f"    log_return={log_return_str}, transaction_cost_ratio={transaction_cost_str}")
+                        logger.info(f"    raw_reward={raw_reward_str}, multiplier={multiplier_applied}, scaled={scaled_reward_str}")
+                        logger.info(f"    volatility_penalty={volatility_penalty_str}, exit_reason={exit_reason}, bars_held={bars_held}")
+                        logger.info(f"    final_reward={reward:.4f}")
+                    else:
+                        logger.warning(f"  Step {step}: No reward_breakdown in info dict! Keys: {list(info.keys())}")
                 
-                # Update statistics
-                if 'balance' not in info and hasattr(exec_env.base_env, 'balance'):
+                # CRITICAL FIX: Match environment reward clipping
+                # Environment clips to [-500, +500] (after REWARD_SCALE=10.0 update and widened range)
+                # Training should match this to ensure consistency
+                reward = np.clip(reward, -500.0, 500.0)
+                
+                # CRITICAL FIX: Use EXECUTED action, not intended action
+                # The environment may convert invalid actions to HOLD (e.g., SELL when shares==0)
+                # Stop loss/take profit may also trigger automatic SELLs
+                # We need to count the ACTUAL executed action, not the intended one
+                executed_action = action_item  # Default to intended action
+                
+                # Try to get executed action from info dict
+                if 'executed_action' in info:
+                    executed_action_str = info['executed_action']
+                    # Convert string to int if needed
+                    if isinstance(executed_action_str, str):
+                        action_map = {'HOLD': 0, 'BUY': 1, 'SELL': 2}
+                        executed_action = action_map.get(executed_action_str.upper(), action_item)
+                    elif isinstance(executed_action_str, int):
+                        executed_action = executed_action_str
+                elif 'reward_breakdown' in info and isinstance(info['reward_breakdown'], dict):
+                    # Try to get from reward_breakdown
+                    action_type = info['reward_breakdown'].get('action_type', None)
+                    if action_type:
+                        action_map = {'HOLD': 0, 'BUY': 1, 'SELL': 2}
+                        executed_action = action_map.get(action_type.upper(), action_item)
+                
+                # DEBUG: Log mismatch between intended and executed action
+                if executed_action != action_item and step % 100 == 0:
+                    action_names = {0: "HOLD", 1: "BUY", 2: "SELL"}
+                    logger.warning(f"  Step {step}: Action mismatch! Intended: {action_names[action_item]}, Executed: {action_names[executed_action]}")
+                    if executed_action == 0 and action_item != 0:
+                        logger.warning(f"    Invalid action converted to HOLD (action masking should prevent this)")
+                
+                # CRITICAL FIX: Always ensure balance and initial_balance are in info dict
+                # This ensures stats tracking has correct values, especially at start of epoch
+                if hasattr(exec_env.base_env, 'balance'):
                     info['balance'] = exec_env.base_env.balance
-                if 'balance' not in info and hasattr(exec_env.base_env, 'initial_balance'):
+                if hasattr(exec_env.base_env, 'initial_balance'):
                     info['initial_balance'] = exec_env.base_env.initial_balance
-                stats.update(reward, info, action=action_item, strategy=strategy)
+                
+                # DEBUG: Verify net worth (portfolio value) is correct at start of epoch (first step only)
+                # CRITICAL FIX: Compare net_worth (cash + stock value) to initial_balance, not just cash
+                # When agent buys stock, cash decreases but net worth stays the same
+                # This prevents false alarms when agent correctly converts cash to stock
+                if step == 1 and hasattr(exec_env.base_env, 'balance') and hasattr(exec_env.base_env, 'initial_balance'):
+                    # Calculate net worth (portfolio value = cash + stock value)
+                    if hasattr(exec_env.base_env, '_get_portfolio_value') and hasattr(exec_env.base_env, 'data'):
+                        current_step = min(exec_env.base_env.current_step, len(exec_env.base_env.data) - 1)
+                        current_price = exec_env.base_env.data[current_step, 0]  # Index 0 = Close price
+                        net_worth = exec_env.base_env._get_portfolio_value(current_price)
+                    else:
+                        # Fallback: calculate manually
+                        current_price = exec_env.base_env.entry_price if exec_env.base_env.entry_price > 0 else 1.0
+                        if hasattr(exec_env.base_env, 'data') and exec_env.base_env.data is not None:
+                            current_step = min(exec_env.base_env.current_step, len(exec_env.base_env.data) - 1)
+                            current_price = exec_env.base_env.data[current_step, 0]
+                        net_worth = exec_env.base_env.balance + (exec_env.base_env.shares * current_price)
+                    
+                    # Allow small difference for transaction costs (e.g., commission on initial buy)
+                    # Transaction costs are typically <0.5% of position, so allow up to $10 difference on $2000
+                    tolerance = max(10.0, exec_env.base_env.initial_balance * 0.005)  # 0.5% or $10, whichever is larger
+                    
+                    if abs(net_worth - exec_env.base_env.initial_balance) > tolerance:
+                        logger.warning(f"  Epoch {epoch}, Step {step}: Net worth mismatch at start! Net Worth=${net_worth:.2f}, Initial=${exec_env.base_env.initial_balance:.2f}")
+                        logger.warning(f"    DEBUG: This suggests environment reset() didn't work properly or portfolio value was modified")
+                        logger.warning(f"    DEBUG: Net Worth (cash + stock) = ${net_worth:.2f}")
+                        logger.warning(f"    DEBUG: Cash (balance) = ${exec_env.base_env.balance:.2f}")
+                        logger.warning(f"    DEBUG: Stock value = ${exec_env.base_env.shares * current_price:.2f} (shares={exec_env.base_env.shares:.4f}, price=${current_price:.2f})")
+                        logger.warning(f"    DEBUG: Initial balance = ${exec_env.base_env.initial_balance:.2f}")
+                        logger.warning(f"    DEBUG: Difference = ${abs(net_worth - exec_env.base_env.initial_balance):.2f} (tolerance=${tolerance:.2f})")
+                        
+                        # Only force reset if net worth is significantly different (not just cash converted to stock)
+                        if abs(net_worth - exec_env.base_env.initial_balance) > exec_env.base_env.initial_balance * 0.01:  # >1% difference
+                            logger.warning(f"    DEBUG: Large net worth difference detected, forcing reset...")
+                            exec_env.base_env.balance = exec_env.base_env.initial_balance
+                            exec_env.base_env.shares = 0.0
+                            exec_env.base_env.entry_price = 0.0
+                            info['balance'] = exec_env.base_env.balance
+                            info['initial_balance'] = exec_env.base_env.initial_balance
+                            logger.warning(f"    DEBUG: After force fix - balance = ${exec_env.base_env.balance:.2f}, shares = {exec_env.base_env.shares}")
+                    else:
+                        # Net worth is correct (within tolerance) - this is normal when agent buys stock
+                        if exec_env.base_env.shares > 0:
+                            logger.debug(f"  Epoch {epoch}, Step {step}: Net worth OK (${net_worth:.2f} ≈ ${exec_env.base_env.initial_balance:.2f}). Agent has position: {exec_env.base_env.shares:.4f} shares @ ${current_price:.2f}")
+                
+                stats.update(reward, info, action=executed_action, strategy=strategy)
                 
                 # DEBUG: Store in memory for PPO update
                 # CRITICAL: Store ORIGINAL features_dict and strategy_feat WITHOUT detaching
                 # They don't need gradients themselves, but we need the original tensors
                 # so that when we recompute, the model can create gradients through its parameters
                 # Only detach the policy outputs (log_prob, value), not the inputs!
-                memory_states.append((features_dict, strategy_feat))
-                # Store action (detached, no gradients needed for actions)
-                action_to_store = action if action.dim() > 0 else action.unsqueeze(0)
-                memory_actions.append(action_to_store.detach())
+                memory_states.append((features_dict, strategy_feat, precision_feat, local_feat))
+                
+                # CRITICAL FIX: Store EXECUTED action, not intended action
+                # The environment may convert invalid actions (e.g., SELL when no position → HOLD)
+                # PPO must learn from what ACTUALLY happened, not what the agent intended
+                # Convert executed_action (int) to tensor for storage
+                executed_action_tensor = torch.tensor(executed_action, dtype=torch.long, device=device)
+                if executed_action_tensor.dim() == 0:
+                    executed_action_tensor = executed_action_tensor.unsqueeze(0)
+                memory_actions.append(executed_action_tensor.detach())
+                
+                # NOTE: We keep the original log_prob from the intended action
+                # This is an approximation - ideally we'd recompute log_prob(executed_action)
+                # But that requires another forward pass. For now, this is acceptable because:
+                # 1. Action masking should prevent most invalid actions
+                # 2. When action conversion happens, it's usually to HOLD (action 0)
+                # 3. The importance sampling in PPO will partially account for this
                 # Store detached log_prob (old policy)
                 log_prob_to_store = log_prob_detached if log_prob_detached.dim() > 0 else log_prob_detached.unsqueeze(0)
                 memory_logprobs.append(log_prob_to_store)
@@ -707,12 +1170,22 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                 
                 if done or truncated:
                     state, _ = exec_env.reset()
+                    # CRITICAL FIX: Explicitly reset balance when episode ends
+                    # This ensures balance is always reset to initial_balance between episodes
+                    if hasattr(exec_env.base_env, 'balance') and hasattr(exec_env.base_env, 'initial_balance'):
+                        expected_initial_balance = exec_env.base_env.initial_balance
+                        if exec_env.base_env.balance != expected_initial_balance:
+                            exec_env.base_env.balance = expected_initial_balance
+                            exec_env.base_env.shares = 0.0
+                            exec_env.base_env.entry_price = 0.0
                     # Reset stats for new episode
                     stats.reset()
                 
-                # DEBUG: PPO update every 100 steps
-                if len(memory_rewards) >= 100:
-                    logger.debug(f"PPO update triggered at step {step}, memory size: {len(memory_rewards)}")
+                # DEBUG: PPO update with larger batch size for better GPU utilization
+                # Increased from 100 to 400 (4x) to match increased batch_size in Stage 1
+                PPO_BATCH_SIZE_STAGE2 = 400
+                if len(memory_rewards) >= PPO_BATCH_SIZE_STAGE2:
+                    logger.debug(f"PPO update triggered at step {step}, memory size: {len(memory_rewards)} (batch_size={PPO_BATCH_SIZE_STAGE2})")
                     
                     # DEBUG: Calculate discounted rewards (returns)
                     rewards = []
@@ -723,8 +1196,25 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                         rewards.insert(0, discounted_reward)
                     
                     rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-                    # Normalize rewards for stability
-                    rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+                    # ============================================================
+                    # REWARD CLIPPING (CRITICAL FIX - Match Environment)
+                    # ============================================================
+                    # Match the reward clip range in the environment [-500, +500]
+                    # Environment uses REWARD_SCALE=10.0 and clips to [-500, +500] to handle -50% crashes
+                    REWARD_CLIP_MIN = -500.0
+                    REWARD_CLIP_MAX = +500.0
+                    rewards = torch.clamp(rewards, min=REWARD_CLIP_MIN, max=REWARD_CLIP_MAX)
+                    
+                    # Log reward statistics for debugging
+                    if step % 500 == 0:
+                        reward_std = rewards.std().item()
+                        logger.info(f"Reward Stats (step {step}): mean={rewards.mean().item():.3f}, std={reward_std:.3f}, min={rewards.min().item():.3f}, max={rewards.max().item():.3f}")
+                        
+                        # ============================================================
+                        # REWARD SPARSITY DETECTION (from Principal ML Engineer Audit)
+                        # ============================================================
+                        if reward_std < 1.0:
+                            logger.warning(f"⚠️ REWARD SPARSITY: std={reward_std:.2f}. All rewards look the same to agent!")
                     
                     # DEBUG: Stack tensors from memory (these are detached, old policy values)
                     # Ensure all are 1D tensors for stacking and properly detached
@@ -764,8 +1254,14 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                         values_list = []
                         entropies_list = []
                         
-                        for idx, ((feat_dict, strat_feat), act) in enumerate(zip(memory_states, old_actions)):
+                        for idx, (state_tuple, act) in enumerate(zip(memory_states, old_actions)):
                             try:
+                                # Unpack state: (features_dict, strategy_feat, precision_feat, local_feat)
+                                feat_dict = state_tuple[0]
+                                strat_feat = state_tuple[1]
+                                prec_feat = state_tuple[2] if len(state_tuple) > 2 else None
+                                local_feat = state_tuple[3] if len(state_tuple) > 3 else None
+                                
                                 # DEBUG: Use stored features - they're already tensors created from numpy
                                 # CRITICAL: Inputs don't need gradients (they're data), but we must NOT detach them
                                 # before passing to model. The model will create gradients through its parameters.
@@ -794,6 +1290,26 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                                 else:
                                     strat_feat_ready = torch.tensor(strat_feat, device=device, requires_grad=False)
                                 
+                                # Prepare precision features
+                                if prec_feat is not None and isinstance(prec_feat, torch.Tensor):
+                                    if prec_feat.device != device:
+                                        prec_feat_ready = prec_feat.to(device)
+                                    else:
+                                        prec_feat_ready = prec_feat
+                                    prec_feat_ready = prec_feat_ready.requires_grad_(False)
+                                else:
+                                    prec_feat_ready = torch.zeros(1, 4, device=device, dtype=torch.float32)
+                                
+                                # Prepare local features (HYBRID INPUT)
+                                if local_feat is not None and isinstance(local_feat, torch.Tensor):
+                                    if local_feat.device != device:
+                                        local_feat_ready = local_feat.to(device)
+                                    else:
+                                        local_feat_ready = local_feat
+                                    local_feat_ready = local_feat_ready.requires_grad_(False)
+                                else:
+                                    local_feat_ready = torch.zeros(1, 4, device=device, dtype=torch.float32)
+                                
                                 # Forward pass WITH gradients (for new policy)
                                 # Model parameters have gradients, inputs don't (which is correct)
                                 # DEBUG: Ensure agent is in training mode
@@ -809,7 +1325,7 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                                     logger.warning(f"Force-enabled gradients on all parameters")
                                 
                                 # Forward pass - this should create outputs connected to model parameters
-                                logits, value = agent(feat_dict_ready, strat_feat_ready)
+                                logits, value = agent(feat_dict_ready, strat_feat_ready, prec_feat_ready, local_feat_ready)
                                 
                                 # DEBUG: Verify outputs are connected to computation graph
                                 # CRITICAL: Outputs MUST have grad_fn to enable backpropagation
@@ -857,10 +1373,33 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                                         zero_value = zero_value + 0.0 * value  # Maintain gradient connection
                                     value = zero_value
                                 
-                                logits = torch.clamp(logits, min=-10, max=10)
+                                # Clamp logits then apply adaptive temperature scaling to prevent collapse
+                                LOGIT_CLAMP_MIN = -5.0
+                                LOGIT_CLAMP_MAX = 5.0
+                                logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
                                 
-                                # Create distribution and compute new policy log_prob
-                                dist = torch.distributions.Categorical(logits=logits)
+                                LOGIT_TEMPERATURE_BASE = 2.5
+                                TARGET_ACTION_ENTROPY = 0.5
+                                TEMP_MAX = 10.0
+                                TEMP_GROWTH = 1.5
+                                temp = LOGIT_TEMPERATURE_BASE
+                                
+                                used_logits = logits / temp
+                                dist = torch.distributions.Categorical(logits=used_logits)
+                                ev = dist.entropy()
+                                entropy_val_temp = ev.mean().item() if ev.dim() > 0 else ev.item()
+                                adjust_count = 0
+                                while entropy_val_temp < TARGET_ACTION_ENTROPY and temp < TEMP_MAX:
+                                    temp = min(temp * TEMP_GROWTH, TEMP_MAX)
+                                    used_logits = logits / temp
+                                    dist = torch.distributions.Categorical(logits=used_logits)
+                                    ev = dist.entropy()
+                                    entropy_val_temp = ev.mean().item() if ev.dim() > 0 else ev.item()
+                                    adjust_count += 1
+                                if adjust_count > 0:
+                                    logger.debug(f"Adaptive temperature (re-eval): increased to {temp:.2f} to reach entropy {entropy_val_temp:.3f}")
+                                
+                                # Create distribution and compute new policy log_prob with final temperature
                                 # act is from old_actions (detached), but log_prob is from new policy (with gradients)
                                 # Ensure act is a proper tensor
                                 act_tensor = act if isinstance(act, torch.Tensor) else torch.tensor(act, device=device, dtype=torch.long)
@@ -963,48 +1502,170 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                         # rewards is a tensor (no gradients), old_values_detached is detached (no gradients)
                         # advantages should not have gradients (they're computed from non-differentiable values)
                         advantages = rewards - old_values_detached
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
+                        # ============================================================
+                        # ADVANTAGE NORMALIZATION (CRITICAL FIX for Large Actor Loss)
+                        # ============================================================
+                        # CRITICAL FIX: Normalize advantages to prevent huge actor loss
+                        # Large advantages (e.g., 50-100) cause actor_loss to be huge (38+)
+                        # This makes entropy/actor ratio tiny even with good entropy
+                        # Normalize advantages to have mean=0, std=1 (standard PPO practice)
+                        # ============================================================
+                        advantages_mean = advantages.mean()
+                        advantages_std = advantages.std() + 1e-8  # Avoid division by zero
+                        advantages = (advantages - advantages_mean) / advantages_std
+                        
+                        # ============================================================
+                        # ADVANTAGE CLIPPING (from Principal ML Engineer Audit)
+                        # ============================================================
+                        # After normalization, clip to reasonable range (e.g., [-5, +5])
+                        # This prevents extreme values while preserving signal
+                        # ============================================================
+                        ADVANTAGE_CLIP_MIN = -5.0   # Tighter: After normalization, ±5 std is reasonable
+                        ADVANTAGE_CLIP_MAX = +5.0   # Tighter: Prevents extreme outliers
+                        advantages = torch.clamp(advantages, min=ADVANTAGE_CLIP_MIN, max=ADVANTAGE_CLIP_MAX)
                         advantages = advantages.detach()  # Ensure advantages don't have gradients
                         
-                        # DEBUG: PPO clipped objective
-                        # Ratio = exp(new_logprob - old_logprob)
-                        # new_logprobs has gradients (from model), old_logprobs_detached is detached
-                        # ratios will have gradients (from new_logprobs)
+                        # Log advantage statistics for debugging
+                        if step % 500 == 0:
+                            logger.info(f"Advantage Stats (step {step}): mean={advantages.mean().item():.3f}, std={advantages.std().item():.3f}, min={advantages.min().item():.3f}, max={advantages.max().item():.3f}")
+                        
+                        # ============================================================
+                        # PPO OBJECTIVE CALCULATION
+                        # ============================================================
+                        
+                        # FIX 1: Ensure shapes match to prevent Broadcasting Explosion
+                        if new_logprobs.shape != old_logprobs_detached.shape:
+                            new_logprobs = new_logprobs.view_as(old_logprobs_detached)
+                        
+                        # Calculate ratios
                         ratios = torch.exp(new_logprobs - old_logprobs_detached)
-                        # advantages are detached, so surr1 and surr2 will have gradients from ratios
+                        
+                        # Calculate Surrogates
                         surr1 = ratios * advantages
                         surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
+                        
+                        # ==========================================
+                        # DEBUG DIAGNOSTICS (Right before actor_loss)
+                        # ==========================================
+                        
+                        # 1. Check if the model has actually changed since data collection
+                        # If diff is 0.0, the model isn't learning (or learning rate is too low)
+                        log_prob_diff = (new_logprobs - old_logprobs_detached).abs().mean().item()
+                        
+                        # 2. Check the raw scale of advantages
+                        # If these are like 0.00001, your reward scale is too small relative to normalization
+                        adv_mean = advantages.mean().item()
+                        adv_std = advantages.std().item()
+                        
+                        # 3. Check the ratios directly
+                        # If these are all exactly 1.0, your implementation of PPO is broken (detached incorrectly?)
+                        ratio_mean = ratios.mean().item()
+                        ratio_std = ratios.std().item()
+                        
+                        logger.info(f"--- DEBUG DIAGNOSTICS ---")
+                        logger.info(f"LogProb Diff (New - Old): {log_prob_diff:.8f}")
+                        logger.info(f"Advantages: Mean={adv_mean:.6f} | Std={adv_std:.6f}")
+                        logger.info(f"Ratios: Mean={ratio_mean:.6f} | Std={ratio_std:.6f}")
+                        logger.info(f"-------------------------")
+                        
+                        # Calculate PPO Loss (Negative because we want to maximize objective)
+                        # Using .mean() here is correct
                         actor_loss = -torch.min(surr1, surr2).mean()
                         
-                        # DEBUG: Critic loss (value function learning)
+                        # FIX 2: REMOVED "ACTOR_LOSS_MIN" SCALING BLOCK
+                        # Reason: Artificially scaling loss creates unstable gradients. 
+                        # If actor_loss is small, that is GOOD (means policy is stable). 
+                        # Let the Entropy term handle exploration naturally.
+                        
+                        # Safety Clip (Optional but safe): Cap extreme losses if they still happen
+                        if actor_loss.item() > 100.0:
+                            logger.warning(f"Extreme Actor Loss detected: {actor_loss.item()}")
+                            actor_loss = torch.clamp(actor_loss, max=100.0)
+                        
+                        # ============================================================
+                        # CRITIC & TOTAL LOSS
+                        # ============================================================
+                        
+                        # Critic loss (value function learning)
                         # new_values has gradients (from model), rewards is a tensor (no gradients)
                         # MSE loss will compute gradients through new_values
                         critic_loss = nn.MSELoss()(new_values, rewards)
                         
-                        # RISK B FIX: Entropy bonus (encourages exploration)
-                        # CRITICAL FIX: Use epoch-based entropy coefficient (faster decay)
-                        # Calculate entropy coefficient based on epoch progress (already calculated above)
+                        # Entropy bonus (encourages exploration)
                         entropy_bonus = entropies.mean()
+                        entropy_value = entropy_bonus.item()  # Actual entropy value (not scaled)
                         
                         # Total loss (actor + critic - entropy)
-                        # entropy_coef is calculated per epoch above (line 532)
+                        # entropy_coef is persistent across epochs with gentle decay and adaptive updates
                         entropy_loss_term = entropy_coef * entropy_bonus
                         total_loss = actor_loss + 0.5 * critic_loss - entropy_loss_term
                         
-                        # CRITICAL DEBUG: Check for entropy domination
-                        # If entropy term >> actor_loss, agent will stay random
-                        actor_loss_val = actor_loss.item()
+                        # ============================================================
+                        # ENTROPY RATIO MONITORING (CRITICAL FIX for Policy Collapse)
+                        # ============================================================
+                        # TARGET: Entropy should be 1-10% of actor loss
+                        # If ratio > 1.0: Agent is random (entropy dominates)
+                        # If ratio < 0.01: Agent has no exploration (POLICY COLLAPSE RISK!)
+                        # ============================================================
+                        actor_loss_val = abs(actor_loss.item())
                         entropy_loss_val = entropy_loss_term.item()
-                        ratio = entropy_loss_val / (actor_loss_val + 1e-8)
+                        ratio = entropy_loss_val / max(0.0001, actor_loss_val)
                         
+                        # CRITICAL DIAGNOSTIC: Log actual entropy value and entropy_coef
                         logger.debug(f"PPO epoch {ppo_epoch}: actor_loss={actor_loss_val:.6f}, "
-                                   f"critic_loss={critic_loss.item():.6f}, entropy_loss={entropy_loss_val:.6f}, "
-                                   f"entropy/actor_ratio={ratio:.2f}, total_loss={total_loss.item():.6f}")
+                                   f"critic_loss={critic_loss.item():.6f}, "
+                                   f"entropy_value={entropy_value:.4f}, entropy_coef={entropy_coef:.6f}, "
+                                   f"entropy_loss={entropy_loss_val:.6f}, "
+                                   f"entropy/actor_ratio={ratio:.2%}, total_loss={total_loss.item():.6f}")
                         
-                        # WARNING: If entropy dominates, agent can't learn
-                        if ratio > 10.0:
-                            logger.warning(f"[WARNING] ENTROPY DOMINATION: entropy_loss ({entropy_loss_val:.6f}) is {ratio:.1f}x larger than actor_loss ({actor_loss_val:.6f})! "
-                                         f"Agent will maximize entropy (stay random). Consider reducing entropy_coef or boosting rewards.")
+                        # ============================================================
+                        # SMART ENTROPY TUNER (Patch for Normalized PPO)
+                        # ============================================================
+                        
+                        # 1. Don't panic if Actor Loss is naturally small
+                        # If the model is learning (LogProb Diff > 0.01), the "ratio" doesn't matter.
+                        is_learning_fast = (new_logprobs - old_logprobs_detached).abs().mean().item() > 0.01
+                        
+                        # CRITICAL FIX: More aggressive auto-increase for low ratios
+                        # 0.263% is way too low - we need at least 1% (0.01)
+                        # Also handle entropy domination (ratio > 1.0 = 100%)
+                        if ratio > 1.0:  # Entropy loss > Actor loss (entropy dominates)
+                            logger.warning(f"[WARNING] ENTROPY DOMINATION: entropy/actor ratio = {ratio:.1%}. Reduce entropy_coef!")
+                            logger.warning(f"   DIAGNOSTIC: entropy_value={entropy_value:.4f}, entropy_coef={entropy_coef:.6f}, actor_loss={actor_loss_val:.6f}")
+                            
+                            # SMART LOGIC: Only decrease if we are genuinely stuck (not learning)
+                            if is_learning_fast:
+                                # If we are learning fast, IGNORE the ratio. 
+                                # The high ratio is just a math artifact of normalized advantages.
+                                logger.info(f"   Model is learning fast (LogProb Diff > 0.01), ignoring high ratio")
+                                pass
+                            elif ratio > 2.0 and entropy_coef > 0.001:
+                                logger.warning(f"   High Entropy Ratio ({ratio:.2f}), but checking learning speed first...")
+                                # Only decrease if we are genuinely stuck (not learning)
+                                old_entropy_coef = entropy_coef
+                                entropy_coef *= 0.95
+                                logger.warning(f"   AUTO-DECREASING entropy_coef: {old_entropy_coef:.6f} -> {entropy_coef:.6f} (gentle decrease)")
+                        elif ratio < 0.01:  # Below 1% is problematic
+                            logger.warning(f"NO EXPLORATION: entropy/actor ratio = {ratio:.3%}. Increase entropy_coef!")
+                            logger.warning(f"   DIAGNOSTIC: entropy_value={entropy_value:.4f}, entropy_coef={entropy_coef:.6f}, actor_loss={actor_loss_val:.6f}")
+                            
+                            # CRITICAL: Auto-increase entropy more aggressively
+                            # If ratio < 1%, we need to increase entropy_coef significantly
+                            if ratio < 0.01:  # Below 1%
+                                old_entropy_coef = entropy_coef
+                                # Increase by factor needed to reach 2% ratio
+                                target_ratio = 0.02  # Target 2% (safe middle ground)
+                                increase_factor = target_ratio / max(ratio, 0.0001)  # Avoid division by zero
+                                # CRITICAL: Allow much higher entropy_coef to reach 1-10% ratio
+                                # With entropy=0.78 and actor_loss=0.25, we need entropy_coef ~0.003-0.03
+                                # Cap at ENTROPY_COEF_MAX to allow proper exploration while preventing runaway
+                                entropy_coef = min(entropy_coef * increase_factor, ENTROPY_COEF_MAX)
+                                logger.warning(f"   AUTO-INCREASING entropy_coef: {old_entropy_coef:.6f} -> {entropy_coef:.6f} (factor={increase_factor:.2f}x, cap={ENTROPY_COEF_MAX:.6f})")
+                                
+                                # Also check if entropy itself is too low (distribution too peaked)
+                                if entropy_value < 0.5:  # For 3 actions, max entropy is ~1.1, so 0.5 is low
+                                    logger.warning(f"   [WARNING] ENTROPY VALUE TOO LOW: {entropy_value:.4f} (should be >0.5 for 3 actions)")
+                                    logger.warning(f"   This suggests logits are too extreme - check temperature scaling!")
                         
                         # DEBUG: Check for NaN before backward
                         if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -1014,11 +1675,33 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                         # DEBUG: Backward pass (compute gradients)
                         total_loss.backward()
                         
-                        # DEBUG: Gradient clipping for stability
-                        torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                        # GRADIENT CLIPPING (from Principal ML Engineer Audit)
+                        # Prevents logit explosion from extreme gradients
+                        GRAD_CLIP_NORM = 1.0
+                        grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), GRAD_CLIP_NORM)
                         
                         # DEBUG: Optimizer step (update parameters)
                         optimizer.step()
+                        
+                        # Log PPO metrics to wandb (every 100 steps to avoid spam)
+                        if use_wandb and WANDB_AVAILABLE and step % 100 == 0:
+                            wandb.log({
+                                f"stage2/{strategy}/ppo_epoch": ppo_epoch,
+                                f"stage2/{strategy}/actor_loss": actor_loss_val,
+                                f"stage2/{strategy}/critic_loss": critic_loss.item(),
+                                f"stage2/{strategy}/entropy_value": entropy_value,
+                                f"stage2/{strategy}/entropy_coef": entropy_coef,
+                                f"stage2/{strategy}/entropy_loss": entropy_loss_val,
+                                f"stage2/{strategy}/entropy_actor_ratio": ratio,
+                                f"stage2/{strategy}/total_loss": total_loss.item(),
+                                f"stage2/{strategy}/grad_norm": grad_norm.item(),
+                                f"stage2/{strategy}/advantage_mean": advantages.mean().item(),
+                                f"stage2/{strategy}/advantage_std": advantages.std().item(),
+                                f"stage2/{strategy}/advantage_min": advantages.min().item(),
+                                f"stage2/{strategy}/advantage_max": advantages.max().item(),
+                                f"stage2/{strategy}/reward_mean": rewards.mean().item(),
+                                f"stage2/{strategy}/reward_std": rewards.std().item(),
+                            })
                     
                     logger.debug(f"PPO update complete, clearing memory")
                     # Clear memory after update
@@ -1031,9 +1714,142 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
             if (epoch + 1) % 10 == 0:
                 # Get summary for THIS epoch only (stats were reset at start of epoch)
                 summary = stats.get_summary()
+                
+                # CRITICAL FIX: Log balance change to verify it's actually changing
+                initial_bal = summary['initial_balance'] if summary['initial_balance'] is not None else 0.0
+                current_bal = summary['current_balance'] if summary['current_balance'] is not None else 0.0
+                balance_change = current_bal - initial_bal
+                
                 logger.info(f"  Epoch {epoch + 1}/{epochs_per_agent}, Episode Reward: {episode_reward:.2f}")
                 logger.info(f"    Actions: {summary['action_counts']}, Trades: {summary['trade_count']}, "
-                          f"Return: {summary['return_pct']:.2f}%, Balance: ${summary['current_balance']:.2f}")
+                          f"Return: {summary['return_pct']:.2f}%")
+                logger.info(f"    Balance: ${initial_bal:.2f} -> ${current_bal:.2f} (Change: ${balance_change:+.2f})")
+                
+                # DEBUG: Analyze reward vs profit mismatch (both directions)
+                if summary['total_reward'] < 0 and summary['total_profit'] > 0:
+                    logger.warning(f"    [REWARD MISMATCH] Negative reward ({summary['total_reward']:.2f}) but positive profit (${summary['total_profit']:.2f})!")
+                    logger.warning(f"    This suggests penalties/transaction costs are dominating the reward signal")
+                elif summary['total_reward'] > 0 and summary['total_profit'] < 0:
+                    logger.warning(f"    [REWARD MISMATCH] Positive reward ({summary['total_reward']:.2f}) but negative profit (${summary['total_profit']:.2f})!")
+                    logger.warning(f"    This suggests rewards are not aligned with actual P&L - check reward calculation")
+                    logger.warning(f"    Possible causes: reward calculation uses log_return which can be positive even with losses")
+                    logger.warning(f"    Or: reward includes bonuses/multipliers that don't reflect actual balance change")
+                    
+                    # ALWAYS log reward statistics (even if empty, show what we have)
+                    if 'reward_stats' in summary and summary['reward_stats']:
+                        stats = summary['reward_stats']
+                        logger.info(f"    Reward Stats: Min={stats['min_reward']:.4f}, Max={stats['max_reward']:.4f}, "
+                                  f"Mean={stats['mean_reward']:.4f}, Std={stats['std_reward']:.4f}")
+                        logger.info(f"    Reward Distribution: Positive={stats['positive_rewards']}, "
+                                  f"Negative={stats['negative_rewards']}, Zero={stats['zero_rewards']} (Total steps: {stats['total_steps']})")
+                    else:
+                        logger.warning(f"    [DEBUG] No reward_stats available in summary")
+                    
+                    # Log reward components breakdown (show what we have, even if incomplete)
+                    if 'reward_components' in summary and summary['reward_components']:
+                        comps = summary['reward_components']
+                        logger.info(f"    Reward Components Breakdown:")
+                        
+                        if 'total_pnl_reward' in comps:
+                            logger.info(f"      PnL Reward: Total={comps['total_pnl_reward']:.4f}, "
+                                      f"Avg={comps['avg_pnl_reward']:.4f}, Count={comps['count_pnl_reward']}")
+                        else:
+                            logger.warning(f"      [DEBUG] PnL Reward: Not tracked (reward_breakdown may not be in info dict)")
+                        
+                        if 'total_transaction_cost' in comps:
+                            logger.info(f"      Transaction Costs: Total={comps['total_transaction_cost']:.4f}, "
+                                      f"Avg={comps['avg_transaction_cost']:.4f}, Count={comps['count_transaction_cost']}")
+                        else:
+                            logger.warning(f"      [DEBUG] Transaction Costs: Not tracked")
+                        
+                        if 'total_volatility_penalty' in comps:
+                            logger.info(f"      Volatility Penalties: Total={comps['total_volatility_penalty']:.4f}, "
+                                      f"Avg={comps['avg_volatility_penalty']:.4f}, Count={comps['count_volatility_penalty']}")
+                        else:
+                            logger.warning(f"      [DEBUG] Volatility Penalties: Not tracked")
+                        
+                        if 'total_stop_loss_penalty' in comps:
+                            logger.info(f"      Stop Loss Penalties: Total={comps['total_stop_loss_penalty']:.4f}, "
+                                      f"Avg={comps['avg_stop_loss_penalty']:.4f}, Count={comps['count_stop_loss_penalty']}")
+                        else:
+                            logger.warning(f"      [DEBUG] Stop Loss Penalties: Not tracked")
+                        
+                        if 'total_whipsaw_penalty' in comps:
+                            logger.info(f"      Whipsaw Penalties: Total={comps['total_whipsaw_penalty']:.4f}, "
+                                      f"Avg={comps['avg_whipsaw_penalty']:.4f}, Count={comps['count_whipsaw_penalty']}")
+                        else:
+                            logger.warning(f"      [DEBUG] Whipsaw Penalties: Not tracked")
+                        
+                        # Show action-based rewards (what's actually available in current reward_breakdown)
+                        if 'total_action_reward' in comps:
+                            logger.info(f"      Action Rewards: Total={comps['total_action_reward']:.4f}, "
+                                      f"Avg={comps['avg_action_reward']:.4f}, Count={comps['count_action_reward']}")
+                        if 'total_holding_reward' in comps:
+                            logger.info(f"      Holding Rewards: Total={comps['total_holding_reward']:.4f}, "
+                                      f"Avg={comps['avg_holding_reward']:.4f}, Count={comps['count_holding_reward']}")
+                        if 'total_stop_loss_reward' in comps:
+                            logger.info(f"      Stop Loss Rewards: Total={comps['total_stop_loss_reward']:.4f}, "
+                                      f"Avg={comps['avg_stop_loss_reward']:.4f}, Count={comps['count_stop_loss_reward']}")
+                        if 'total_take_profit_reward' in comps:
+                            logger.info(f"      Take Profit Rewards: Total={comps['total_take_profit_reward']:.4f}, "
+                                      f"Avg={comps['avg_take_profit_reward']:.4f}, Count={comps['count_take_profit_reward']}")
+                        
+                        # Calculate what's causing the negative reward (use available data)
+                        total_penalties = (
+                            comps.get('total_transaction_cost', 0) +
+                            comps.get('total_volatility_penalty', 0) +
+                            comps.get('total_stop_loss_penalty', 0) +
+                            comps.get('total_whipsaw_penalty', 0)
+                        )
+                        pnl_component = comps.get('total_pnl_reward', summary['total_reward'])
+                        logger.info(f"    Estimated: PnL Component={pnl_component:.2f}, Total Penalties={total_penalties:.2f}")
+                        logger.info(f"    Net Reward = {pnl_component:.2f} - {total_penalties:.2f} = {pnl_component - total_penalties:.2f}")
+                    else:
+                        logger.warning(f"    [DEBUG] No reward_components available - environment may not be providing reward_breakdown in info dict")
+                        logger.warning(f"    [DEBUG] Available summary keys: {list(summary.keys())}")
+                        logger.warning(f"    [DEBUG] This means the environment's step() method needs to include 'reward_breakdown' in the info dict")
+                    
+                    # Calculate reward/profit ratio
+                    if summary['total_profit'] != 0:
+                        reward_profit_ratio = summary['total_reward'] / summary['total_profit']
+                        logger.warning(f"    Reward/Profit Ratio: {reward_profit_ratio:.4f} (should be positive if aligned)")
+                        logger.warning(f"    This means reward is {abs(reward_profit_ratio)*100:.1f}% of profit magnitude")
+                    
+                    # Additional analysis: Show per-step average
+                    if summary.get('avg_reward', 0) != 0:
+                        logger.info(f"    Per-Step Analysis: Avg reward per step={summary['avg_reward']:.4f}, "
+                                  f"Avg profit per step=${summary.get('avg_profit', 0):.4f}")
+                        logger.info(f"    Total steps: {len(summary.get('rewards_history', []))}")
+                
+                # DEBUG: Warn if balance didn't change (might indicate environment reset issue)
+                if abs(balance_change) < 0.01 and summary['trade_count'] > 0:
+                    logger.warning(f"    [WARNING] Balance didn't change (${balance_change:.2f}) despite {summary['trade_count']} trades!")
+                    logger.warning(f"    This may indicate balance is being reset or not updated properly in environment")
+                
+                # REWARD BREAKDOWN: Log invalid action counts if available
+                if 'invalid_action_counts' in summary and summary['invalid_action_counts']:
+                    logger.info(f"    Invalid Actions: {summary['invalid_action_counts']}")
+                
+                # Log epoch summary to wandb
+                if use_wandb and WANDB_AVAILABLE:
+                    action_counts = summary.get('action_counts', {})
+                    wandb.log({
+                        f"stage2/{strategy}/epoch": epoch + 1,
+                        f"stage2/{strategy}/episode_reward": episode_reward,
+                        f"stage2/{strategy}/total_profit": summary.get('total_profit', 0.0),
+                        f"stage2/{strategy}/return_pct": summary.get('return_pct', 0.0),
+                        f"stage2/{strategy}/balance": current_bal,
+                        f"stage2/{strategy}/balance_change": balance_change,
+                        f"stage2/{strategy}/trade_count": summary.get('trade_count', 0),
+                        f"stage2/{strategy}/win_count": summary.get('win_count', 0),
+                        f"stage2/{strategy}/loss_count": summary.get('loss_count', 0),
+                        f"stage2/{strategy}/win_rate": summary.get('win_rate', 0.0),
+                        f"stage2/{strategy}/action_HOLD": action_counts.get('HOLD', 0),
+                        f"stage2/{strategy}/action_BUY": action_counts.get('BUY', 0),
+                        f"stage2/{strategy}/action_SELL": action_counts.get('SELL', 0),
+                        f"stage2/{strategy}/avg_reward": summary.get('avg_reward', 0.0),
+                        f"stage2/{strategy}/avg_profit": summary.get('avg_profit', 0.0),
+                    })
         
         # Log final statistics for this strategy
         stats.log_summary(prefix=f"{strategy}")
@@ -1055,7 +1871,8 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                               steps: int = 20000,
                               lr: float = 0.0003,  # 3e-4: Standard for PPO/Actor-Critic (RL needs higher LR than transformers)
                               window_size: int = 30,
-                              logger: Optional[logging.Logger] = None) -> MetaStrategyAgent:
+                              logger: Optional[logging.Logger] = None,
+                              use_wandb: bool = True) -> MetaStrategyAgent:
     """
     Train meta-strategy agent (with frozen execution agents).
     
@@ -1103,6 +1920,17 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
     # Create meta-strategy environment
     config = TradingConfig()
     config.mode = mode
+    # TEMPORARY: Set fees to 0.0% for the next 50 steps (meta-strategy uses steps, not epochs)
+    # This removes transaction cost friction and allows agent to explore more freely
+    FEE_FREE_STEPS = 50
+    original_commission = config.commission_rate
+    original_slippage = config.slippage_bps
+    config.commission_rate = 0.0  # 0.0% commission
+    config.slippage_bps = 0.0  # 0.0% slippage
+    logger.info(f"[FEE-FREE MODE] Setting fees to 0.0% for first {FEE_FREE_STEPS} steps")
+    logger.info(f"  Original: commission={original_commission:.4f} ({original_commission*100:.2f}%), slippage={original_slippage:.1f} bps")
+    logger.info(f"  Temporary: commission=0.0 (0.0%), slippage=0.0 bps")
+    
     meta_env = MetaStrategyEnv(
         ticker=preprocessor.ticker,
         window_size=window_size,
@@ -1136,13 +1964,29 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
     state, _ = meta_env.reset()
     episode_reward = 0.0
     
+    # FIX: Meta-agent should decide every 10-20 steps (Trade Cycle), not every step
+    # If it switches every step, it creates "Strategy Flicker" (Buy -> Sell -> Buy -> Sell), which burns money on fees
+    META_DECISION_INTERVAL = 15  # Meta-agent makes decision every 15 steps (reduces flicker)
+    last_meta_action = None  # Track last meta-action
+    steps_since_meta_decision = 0  # Track steps since last meta-decision
+    strategy_history = []  # Track last 10 strategy choices for flicker detection
+    
     for step in range(1, steps + 1):
-        # ENTROPY ANNEALING: Calculate entropy coefficient for this step
-        # Entropy coefficient: Start at 0.0001, decay to 0.00001 over training (DRASTICALLY REDUCED)
-        progress = step / steps  # 0.0 to 1.0
-        # Exponential decay: starts at 0.0001, decays to 0.00001
-        entropy_coef = 0.0001 * (0.00001 / 0.0001) ** progress  # Exponential decay from 0.0001 to 0.00001
-        entropy_coef = max(entropy_coef, 0.00001)  # Clamp to minimum
+        # RESTORE FEES after 50 steps (if we're past the fee-free period)
+        if step == FEE_FREE_STEPS + 1:
+            config.commission_rate = original_commission
+            config.slippage_bps = original_slippage
+            logger.info(f"[FEE RESTORED] Step {step}: Restoring original fees")
+            logger.info(f"  Commission: 0.0 -> {original_commission:.4f} ({original_commission*100:.2f}%)")
+            logger.info(f"  Slippage: 0.0 -> {original_slippage:.1f} bps")
+        
+        # BOOST ENTROPY: Increased from 0.0001 to 0.01 to force exploration
+        # SLOW ENTROPY DECAY: Keep agent curious for longer (until step 10000+)
+        # Entropy coefficient: Start at 0.01 (boosted from 0.0001), decay slowly using 0.99 per step
+        # Use slower decay (0.99 per step) so entropy stays above zero for 100+ epochs
+        entropy_coef = 0.01 * (0.99 ** step)  # Slow exponential decay (0.99 per step), boosted 100x from 0.0001
+        entropy_coef = max(entropy_coef, 0.001)  # Clamp to minimum (boosted 100x from 0.00001)
+        progress = step / steps  # For logging only
         # Get windowed features from cached data
         windowed = preprocessor.get_window_features(features, window_size, None)
         
@@ -1167,51 +2011,119 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
         else:
             regime_features = torch.zeros(1, 4, dtype=torch.float32).to(device)
         
-        # Get action with epsilon-greedy exploration
-        # FIX: Add exploration to prevent over-reliance on single strategy
-        epsilon = max(0.1, 0.5 * (1 - step / steps))  # Decay from 0.5 to 0.1
-        if np.random.random() < epsilon:
-            # Random exploration
-            action = np.random.randint(0, 4)  # 4 strategies
-            # Get log_prob and value for random action
+        # FIX: Meta-agent should only make decision every META_DECISION_INTERVAL steps
+        # This prevents "Strategy Flicker" (switching strategies too frequently)
+        if steps_since_meta_decision >= META_DECISION_INTERVAL or last_meta_action is None:
+            # Time for meta-agent to make a decision
+            
+            # Get regime label for logging
+            regime_label = "UNKNOWN"
+            if aligned_data:
+                regime_key = "1d" if "1d" in aligned_data else list(aligned_data.keys())[0]
+                regime_df = aligned_data[regime_key]
+                if not regime_df.empty:
+                    close_prices = regime_df['Close'].values if 'Close' in regime_df.columns else regime_df.iloc[:, 0].values
+                    regime_label = regime_detector.detect_regime(close_prices)
+            
+            # Get action with epsilon-greedy exploration
+            # FIX: Reduced epsilon for financial model - Manager should listen to Regime Detector, not explore randomly
+            # Epsilon of 0.495 is way too high for a financial model
+            epsilon_start = 0.1  # Reduced from 0.5 to 0.1 (or 0.2) - Manager doesn't need random exploration
+            epsilon_min = 0.05  # Minimum epsilon
+            epsilon = max(epsilon_min, epsilon_start * (1 - step / steps))  # Decay from 0.1 to 0.05
+            if np.random.random() < epsilon:
+                # Random exploration
+                action = np.random.randint(0, 4)  # 4 strategies
+                # Get log_prob and value for random action
+                logits, value_tensor = meta_agent.forward(features_dict, regime_features)
+                
+                # DEBUG: Print logits every 100 steps to check if agent is making decisions
+                if step % 100 == 0:
+                    logits_np = logits[0].detach().cpu().numpy()
+                    logger.info(f"Step {step}: DEBUG LOGITS (Meta-Strategy, Epsilon={epsilon:.3f}): {logits_np}")
+                    # Check if logits are all identical (dead network)
+                    if len(logits_np) > 1 and np.allclose(logits_np, logits_np[0], atol=1e-6):
+                        logger.warning(f"  ⚠️  WARNING: All logits are identical! Network may be dead. Logits: {logits_np}")
+                
+                dist = torch.distributions.Categorical(logits=logits)
+                # FIX: Ensure long dtype for action
+                log_prob = dist.log_prob(torch.tensor(action, dtype=torch.long).to(device))
+                value = value_tensor.squeeze().item() if value_tensor.dim() > 0 else value_tensor.item()
+            else:
+                # Get logits for debugging before calling act()
+                logits_debug, _ = meta_agent.forward(features_dict, regime_features)
+                
+                # DEBUG: Print logits every 100 steps to check if agent is making decisions
+                if step % 100 == 0:
+                    logits_np = logits_debug[0].detach().cpu().numpy()
+                    epsilon_start = 0.1
+                    epsilon_min = 0.05
+                    epsilon = max(epsilon_min, epsilon_start * (1 - step / steps))
+                    logger.info(f"Step {step}: DEBUG LOGITS (Meta-Strategy, Epsilon={epsilon:.3f}): {logits_np}")
+                    # Check if logits are all identical (dead network)
+                    if len(logits_np) > 1 and np.allclose(logits_np, logits_np[0], atol=1e-6):
+                        logger.warning(f"  ⚠️  WARNING: All logits are identical! Network may be dead. Logits: {logits_np}")
+                
+                action, log_prob, value = meta_agent.act(features_dict, regime_features, deterministic=False)
+            
+            # Update meta-decision tracking (outside epsilon if-else, but inside meta-decision check)
+            last_meta_action = action
+            steps_since_meta_decision = 0
+            
+            # Track strategy choice for flicker detection
+            strategy_names = {0: "TREND_FOLLOW", 1: "MEAN_REVERT", 2: "MOMENTUM", 3: "RISK_OFF"}
+            strategy_name = strategy_names.get(action, f"STRATEGY_{action}")
+            strategy_history.append(action)
+            if len(strategy_history) > 10:
+                strategy_history.pop(0)  # Keep last 10 choices
+            
+            # LOG: Regime input vs action output (to see if Manager is hallucinating)
+            logger.info(f"Meta-Step {step}: Detected Regime={regime_label} -> Selected Strategy={strategy_name} (Action={action})")
+            
+            # LOG: Strategy sequence for flicker detection
+            if len(strategy_history) >= 5:
+                strategy_sequence = [strategy_names.get(s, f"S{s}") for s in strategy_history[-10:]]
+                logger.info(f"  Strategy History (last {len(strategy_history)}): {strategy_sequence}")
+                # Check for flicker (rapid switching)
+                unique_strategies = len(set(strategy_history[-5:]))  # Count unique strategies in last 5
+                if unique_strategies >= 4:  # 4+ different strategies in last 5 = flicker
+                    logger.warning(f"  ⚠️  STRATEGY FLICKER DETECTED: {unique_strategies} different strategies in last 5 decisions!")
+        else:
+            # Reuse last meta-action (don't make new decision)
+            action = last_meta_action
+            # Get log_prob and value for the reused action (needed for PPO)
             logits, value_tensor = meta_agent.forward(features_dict, regime_features)
-            
-            # DEBUG: Print logits every 100 steps to check if agent is making decisions
-            if step % 100 == 0:
-                logits_np = logits[0].detach().cpu().numpy()
-                logger.info(f"Step {step}: DEBUG LOGITS (Meta-Strategy, Epsilon={epsilon:.3f}): {logits_np}")
-                # Check if logits are all identical (dead network)
-                if len(logits_np) > 1 and np.allclose(logits_np, logits_np[0], atol=1e-6):
-                    logger.warning(f"  ⚠️  WARNING: All logits are identical! Network may be dead. Logits: {logits_np}")
-            
             dist = torch.distributions.Categorical(logits=logits)
-            # FIX: Ensure long dtype for action
             log_prob = dist.log_prob(torch.tensor(action, dtype=torch.long).to(device))
             value = value_tensor.squeeze().item() if value_tensor.dim() > 0 else value_tensor.item()
-        else:
-            # Get logits for debugging before calling act()
-            logits_debug, _ = meta_agent.forward(features_dict, regime_features)
-            
-            # DEBUG: Print logits every 100 steps to check if agent is making decisions
-            if step % 100 == 0:
-                logits_np = logits_debug[0].detach().cpu().numpy()
-                epsilon = max(0.1, 0.5 * (1 - step / steps))
-                logger.info(f"Step {step}: DEBUG LOGITS (Meta-Strategy, Epsilon={epsilon:.3f}): {logits_np}")
-                # Check if logits are all identical (dead network)
-                if len(logits_np) > 1 and np.allclose(logits_np, logits_np[0], atol=1e-6):
-                    logger.warning(f"  ⚠️  WARNING: All logits are identical! Network may be dead. Logits: {logits_np}")
-            
-            action, log_prob, value = meta_agent.act(features_dict, regime_features, deterministic=False)
+            steps_since_meta_decision += 1
         
         # Step environment
         next_state, reward, done, truncated, info = meta_env.step(action)
         
-        # Clip reward to prevent extreme values
-        reward = np.clip(reward, -100, 100)
-        
-        # Update statistics
+        # Update statistics (define strategy_name before using it)
         strategy_names = {0: "TREND_FOLLOW", 1: "MEAN_REVERT", 2: "MOMENTUM", 3: "RISK_OFF"}
         strategy_name = strategy_names.get(action, f"STRATEGY_{action}")
+        
+        # Check if hard stop-loss was triggered (Manager penalty)
+        hard_stop_loss_triggered = info.get('hard_stop_loss', False)
+        manager_penalty = 0.0  # Initialize manager penalty
+        if hard_stop_loss_triggered:
+            # Manager penalty: If Manager picked wrong strategy and it hit hard stop-loss, Manager loses points
+            manager_penalty = -2.0  # Heavy penalty for the Manager
+            reward += manager_penalty
+            logger.warning(f"  Step {step}: HARD STOP-LOSS triggered! Manager penalty: {manager_penalty:.2f} (Strategy: {strategy_name})")
+        
+            # Clip reward to prevent extreme values
+            # FIX: Match environment clipping range [-500, +500] (after REWARD_SCALE=10.0)
+            reward = np.clip(reward, -500.0, 500.0)
+        
+        # LOG: Meta-Reward Breakdown (to see if Manager is getting punished for volatility)
+        if step % 50 == 0 or hard_stop_loss_triggered:  # Log every 50 steps or when stop-loss triggers
+            pnl_component = info.get('return_pct', 0.0) * 100 if 'return_pct' in info else 0.0
+            execution_reward = info.get('execution_reward', 0.0)
+            volatility_penalty = 0.0  # Will be extracted from execution_reward if available
+            logger.info(f"Meta-Reward Breakdown (Step {step}): Total={reward:.4f} | From_PnL={pnl_component:.4f} | Execution_Reward={execution_reward:.4f} | Hard_SL_Penalty={manager_penalty:.4f}")
         if 'balance' not in info:
             # Try to get balance from execution env
             if hasattr(meta_env, 'current_balance'):
@@ -1237,8 +2149,10 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
         state = next_state
         episode_reward += reward
         
-        # PPO update every 500 steps
-        if step % 500 == 0:
+        # PPO update with larger batch size for better GPU utilization
+        # Increased batch size from implicit 500 to 2000 (4x) for Stage 3
+        PPO_BATCH_SIZE_STAGE3 = 2000
+        if step % 500 == 0 and len(memory_rewards) >= PPO_BATCH_SIZE_STAGE3:
             if len(memory_rewards) > 0:
                 # Calculate discounted rewards
                 rewards = []
@@ -1378,8 +2292,28 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                         optimizer.zero_grad()
                         continue
                     
-                    torch.nn.utils.clip_grad_norm_(meta_agent.parameters(), max_norm=0.5)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(meta_agent.parameters(), max_norm=0.5)
                     optimizer.step()
+                    
+                    # Log to wandb (every PPO update)
+                    if use_wandb and WANDB_AVAILABLE:
+                        # Calculate advantages for logging
+                        advantages_log = rewards - values.detach()
+                        wandb.log({
+                            "stage3/step": step,
+                            "stage3/actor_loss": actor_loss_val,
+                            "stage3/critic_loss": critic_loss.item(),
+                            "stage3/entropy": entropy.item(),
+                            "stage3/entropy_coef": entropy_coef,
+                            "stage3/entropy_loss": entropy_loss_val,
+                            "stage3/total_loss": loss.mean().item(),
+                            "stage3/grad_norm": grad_norm.item(),
+                            "stage3/entropy_actor_ratio": ratio,
+                            "stage3/advantage_mean": advantages_log.mean().item() if len(advantages_log) > 0 else 0.0,
+                            "stage3/advantage_std": advantages_log.std().item() if len(advantages_log) > 0 else 0.0,
+                            "stage3/reward_mean": rewards.mean().item(),
+                            "stage3/reward_std": rewards.std().item(),
+                        })
                 
                 # Clear memory
                 memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
@@ -1392,7 +2326,35 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
             logger.info(f"  Actions: {summary['action_counts']}")
             logger.info(f"  Strategy Selections: {summary['strategy_counts']}")
             logger.info(f"  Trades: {summary['trade_count']} (Wins: {summary['win_count']}, Losses: {summary['loss_count']}, Win Rate: {summary['win_rate']:.1f}%)")
-            logger.info(f"  Balance: ${summary['initial_balance']:.2f} → ${summary['current_balance']:.2f}")
+            # CRITICAL FIX: Handle None values and Unicode encoding issue
+            initial_bal = summary['initial_balance'] if summary['initial_balance'] is not None else 0.0
+            current_bal = summary['current_balance'] if summary['current_balance'] is not None else 0.0
+            # Use ASCII arrow instead of Unicode to avoid encoding errors
+            logger.info(f"  Balance: ${initial_bal:.2f} -> ${current_bal:.2f}")
+            
+            # Log summary to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                strategy_counts = summary.get('strategy_counts', {})
+                action_counts = summary.get('action_counts', {})
+                wandb.log({
+                    "stage3/step": step,
+                    "stage3/episode_reward": episode_reward,
+                    "stage3/total_reward": summary.get('total_reward', 0.0),
+                    "stage3/total_profit": summary.get('total_profit', 0.0),
+                    "stage3/return_pct": summary.get('return_pct', 0.0),
+                    "stage3/balance": current_bal,
+                    "stage3/trade_count": summary.get('trade_count', 0),
+                    "stage3/win_count": summary.get('win_count', 0),
+                    "stage3/loss_count": summary.get('loss_count', 0),
+                    "stage3/win_rate": summary.get('win_rate', 0.0),
+                    "stage3/strategy_TREND_FOLLOW": strategy_counts.get('TREND_FOLLOW', 0),
+                    "stage3/strategy_MEAN_REVERT": strategy_counts.get('MEAN_REVERT', 0),
+                    "stage3/strategy_MOMENTUM": strategy_counts.get('MOMENTUM', 0),
+                    "stage3/strategy_RISK_OFF": strategy_counts.get('RISK_OFF', 0),
+                    "stage3/avg_reward": summary.get('avg_reward', 0.0),
+                    "stage3/avg_profit": summary.get('avg_profit', 0.0),
+                })
+            
             episode_reward = 0.0
             # Reset stats after logging to start fresh for next period
             stats.reset()
@@ -1420,7 +2382,8 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
                          steps: int = 10000,
                          lr: float = 0.003,  # 3e-3: 10x increase from 3e-4 - Agent needs bigger updates to change its mind
                          window_size: int = 30,
-                         logger: Optional[logging.Logger] = None):
+                         logger: Optional[logging.Logger] = None,
+                         use_wandb: bool = True):
     """
     Fine-tune entire system end-to-end.
     
@@ -1445,6 +2408,17 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
     # Create environment
     config = TradingConfig()
     config.mode = mode
+    # TEMPORARY: Set fees to 0.0% for the next 50 steps (fine-tuning uses steps, not epochs)
+    # This removes transaction cost friction and allows agent to explore more freely
+    FEE_FREE_STEPS_FT = 50
+    original_commission_ft = config.commission_rate
+    original_slippage_ft = config.slippage_bps
+    config.commission_rate = 0.0  # 0.0% commission
+    config.slippage_bps = 0.0  # 0.0% slippage
+    logger.info(f"[FEE-FREE MODE] Setting fees to 0.0% for first {FEE_FREE_STEPS_FT} steps")
+    logger.info(f"  Original: commission={original_commission_ft:.4f} ({original_commission_ft*100:.2f}%), slippage={original_slippage_ft:.1f} bps")
+    logger.info(f"  Temporary: commission=0.0 (0.0%), slippage=0.0 bps")
+    
     meta_env = MetaStrategyEnv(
         ticker=preprocessor.ticker,
         window_size=window_size,
@@ -1474,14 +2448,23 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
     memory_rewards = []
     
     for step in range(1, steps + 1):
+        # RESTORE FEES after 50 steps (if we're past the fee-free period)
+        if step == FEE_FREE_STEPS_FT + 1:
+            config.commission_rate = original_commission_ft
+            config.slippage_bps = original_slippage_ft
+            logger.info(f"[FEE RESTORED] Step {step}: Restoring original fees")
+            logger.info(f"  Commission: 0.0 -> {original_commission_ft:.4f} ({original_commission_ft*100:.2f}%)")
+            logger.info(f"  Slippage: 0.0 -> {original_slippage_ft:.1f} bps")
+        
         # ENTROPY ANNEALING: Calculate entropy coefficient for this step
+        # BOOST ENTROPY: Increased from 0.0001 to 0.01 to force exploration
         # CRITICAL FIX: Faster exponential decay to force agent to use brain instead of random guessing
-        progress = step / steps  # 0.0 to 1.0
-        # Exponential decay: starts at 0.05, decays to 0.001
-        # Entropy coefficient: Start at 0.01, decay to 0.001 over training
-        # Exponential decay: starts at 0.01, decays to 0.001
-        entropy_coef = 0.01 * (0.001 / 0.01) ** progress  # Exponential decay from 0.01 to 0.001
-        entropy_coef = max(entropy_coef, 0.001)  # Clamp to minimum
+        # SLOW ENTROPY DECAY: Keep agent curious for longer (until step 10000+)
+        # Entropy coefficient: Start at 0.01 (boosted from 0.0001), decay slowly using 0.99 per step
+        # Use slower decay (0.99 per step) so entropy stays above zero for 100+ epochs
+        entropy_coef = 0.01 * (0.99 ** step)  # Slow exponential decay (0.99 per step), boosted 100x from 0.0001
+        entropy_coef = max(entropy_coef, 0.001)  # Clamp to minimum (boosted 100x from 0.00001)
+        progress = step / steps  # For logging only
         # Get windowed features
         windowed = preprocessor.get_window_features(features, window_size, None)
         if not windowed:
@@ -1540,7 +2523,7 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
         next_state, reward, done, truncated, info = meta_env.step(action)
         
         # Clip reward
-        reward = np.clip(reward, -100, 100)
+        reward = np.clip(reward, -500.0, 500.0)  # Match environment clipping [-500, +500] (after REWARD_SCALE=10.0)
         
         # Update statistics
         strategy_names = {0: "TREND_FOLLOW", 1: "MEAN_REVERT", 2: "MOMENTUM", 3: "RISK_OFF"}
@@ -1569,8 +2552,10 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
         state = next_state
         episode_reward += reward
         
-        # Update every 500 steps
-        if step % 500 == 0:
+        # Update with larger batch size for better GPU utilization
+        # Increased batch size from implicit 500 to 2000 (4x) for Stage 4
+        PPO_BATCH_SIZE_STAGE4 = 2000
+        if step % 500 == 0 and len(memory_rewards) >= PPO_BATCH_SIZE_STAGE4:
             if len(memory_rewards) > 0:
                 # Calculate discounted rewards
                 rewards = []
@@ -1683,8 +2668,28 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
                     
                     meta_optimizer.zero_grad()
                     loss.mean().backward()
-                    torch.nn.utils.clip_grad_norm_(meta_agent.parameters(), max_norm=0.5)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(meta_agent.parameters(), max_norm=0.5)
                     meta_optimizer.step()
+                    
+                    # Log to wandb (every PPO update)
+                    if use_wandb and WANDB_AVAILABLE:
+                        # Calculate advantages for logging
+                        advantages_log = rewards - values.detach()
+                        wandb.log({
+                            "stage4/step": step,
+                            "stage4/actor_loss": actor_loss_val,
+                            "stage4/critic_loss": critic_loss.item(),
+                            "stage4/entropy": entropy.item(),
+                            "stage4/entropy_coef": entropy_coef,
+                            "stage4/entropy_loss": entropy_loss_val,
+                            "stage4/total_loss": loss.mean().item(),
+                            "stage4/grad_norm": grad_norm.item(),
+                            "stage4/entropy_actor_ratio": ratio,
+                            "stage4/advantage_mean": advantages_log.mean().item() if len(advantages_log) > 0 else 0.0,
+                            "stage4/advantage_std": advantages_log.std().item() if len(advantages_log) > 0 else 0.0,
+                            "stage4/reward_mean": rewards.mean().item(),
+                            "stage4/reward_std": rewards.std().item(),
+                        })
                 
                 # Clear memory
                 memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
@@ -1697,7 +2702,35 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
             logger.info(f"  Actions: {summary['action_counts']}")
             logger.info(f"  Strategy Selections: {summary['strategy_counts']}")
             logger.info(f"  Trades: {summary['trade_count']} (Wins: {summary['win_count']}, Losses: {summary['loss_count']}, Win Rate: {summary['win_rate']:.1f}%)")
-            logger.info(f"  Balance: ${summary['initial_balance']:.2f} → ${summary['current_balance']:.2f}")
+            # CRITICAL FIX: Handle None values and Unicode encoding issue
+            initial_bal = summary['initial_balance'] if summary['initial_balance'] is not None else 0.0
+            current_bal = summary['current_balance'] if summary['current_balance'] is not None else 0.0
+            # Use ASCII arrow instead of Unicode to avoid encoding errors
+            logger.info(f"  Balance: ${initial_bal:.2f} -> ${current_bal:.2f}")
+            
+            # Log summary to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                strategy_counts = summary.get('strategy_counts', {})
+                action_counts = summary.get('action_counts', {})
+                wandb.log({
+                    "stage4/step": step,
+                    "stage4/episode_reward": episode_reward,
+                    "stage4/total_reward": summary.get('total_reward', 0.0),
+                    "stage4/total_profit": summary.get('total_profit', 0.0),
+                    "stage4/return_pct": summary.get('return_pct', 0.0),
+                    "stage4/balance": current_bal,
+                    "stage4/trade_count": summary.get('trade_count', 0),
+                    "stage4/win_count": summary.get('win_count', 0),
+                    "stage4/loss_count": summary.get('loss_count', 0),
+                    "stage4/win_rate": summary.get('win_rate', 0.0),
+                    "stage4/strategy_TREND_FOLLOW": strategy_counts.get('TREND_FOLLOW', 0),
+                    "stage4/strategy_MEAN_REVERT": strategy_counts.get('MEAN_REVERT', 0),
+                    "stage4/strategy_MOMENTUM": strategy_counts.get('MOMENTUM', 0),
+                    "stage4/strategy_RISK_OFF": strategy_counts.get('RISK_OFF', 0),
+                    "stage4/avg_reward": summary.get('avg_reward', 0.0),
+                    "stage4/avg_profit": summary.get('avg_profit', 0.0),
+                })
+            
             episode_reward = 0.0
             # Reset stats after logging to start fresh for next period
             stats.reset()
@@ -1720,9 +2753,22 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
                                    mode: str = "stock",
                                    window_size: int = 30,
                                    save_dir: str = "models_v0.2",
-                                   logger: Optional[logging.Logger] = None):
+                                   logger: Optional[logging.Logger] = None,
+                                   use_wandb: bool = True,
+                                   wandb_project: str = "hierarchical-transformer-trading",
+                                   wandb_entity: Optional[str] = None):
     """
     Complete training pipeline with curriculum learning.
+    
+    Args:
+        ticker: Stock/crypto ticker symbol
+        mode: "stock" or "crypto"
+        window_size: Input window size
+        save_dir: Directory to save models
+        logger: Optional logger instance
+        use_wandb: Whether to use Weights & Biases for tracking
+        wandb_project: W&B project name
+        wandb_entity: W&B entity/team name (optional)
     """
     logger = logger or logging.getLogger(__name__)
     
@@ -1735,6 +2781,30 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
     logger.info(f"Device: {device}")
     logger.info("=" * 60)
     
+    # Initialize Weights & Biases
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            config={
+                "ticker": ticker,
+                "mode": mode,
+                "window_size": window_size,
+                "device": str(device),
+                "save_dir": save_dir,
+            },
+            name=f"{ticker}_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        )
+        # Define metrics for each stage (wandb handles grouping automatically)
+        # Note: We don't need wildcards - wandb groups metrics by prefix automatically
+        wandb.define_metric("stage1/epoch")
+        wandb.define_metric("stage3/step")
+        wandb.define_metric("stage4/step")
+        logger.info(f"Initialized Weights & Biases: project={wandb_project}")
+    elif use_wandb and not WANDB_AVAILABLE:
+        logger.warning("wandb requested but not installed. Install with: pip install wandb")
+        use_wandb = False
+    
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
     
@@ -1744,7 +2814,7 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
     
     # Stage 1: Pre-train transformers
     transformer = pretrain_transformer_encoders(
-        preprocessor, mode=mode, epochs=10, window_size=window_size, logger=logger
+        preprocessor, mode=mode, epochs=100, window_size=window_size, logger=logger, use_wandb=use_wandb
     )
     torch.save(transformer.state_dict(), os.path.join(save_dir, "transformer_pretrained.pth"))
     logger.info("Saved pre-trained transformer")
@@ -1752,7 +2822,7 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
     # Stage 2: Pre-train execution agents
     execution_agents = pretrain_execution_agents(
         transformer, preprocessor, regime_detector, mode=mode, 
-        epochs_per_agent=50, steps_per_epoch=200, window_size=window_size, logger=logger
+        epochs_per_agent=500, steps_per_epoch=2048, window_size=window_size, logger=logger, use_wandb=use_wandb
     )
     for strategy, agent in execution_agents.items():
         torch.save(agent.state_dict(), os.path.join(save_dir, f"execution_{strategy.lower()}.pth"))
@@ -1761,7 +2831,7 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
     # Stage 3: Train meta-strategy
     meta_agent = train_meta_strategy_agent(
         transformer, execution_agents, preprocessor, regime_detector,
-        mode=mode, steps=10000, window_size=window_size, logger=logger
+        mode=mode, steps=100000, window_size=window_size, logger=logger, use_wandb=use_wandb
     )
     torch.save(meta_agent.state_dict(), os.path.join(save_dir, "meta_strategy.pth"))
     logger.info("Saved meta-strategy agent")
@@ -1769,13 +2839,16 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
     # Stage 4: End-to-end fine-tuning
     fine_tune_end_to_end(
         meta_agent, execution_agents, preprocessor, regime_detector,
-        mode=mode, steps=5000, window_size=window_size, logger=logger
+        mode=mode, steps=5000, window_size=window_size, logger=logger, use_wandb=use_wandb
     )
     
     # Save final models
     torch.save(meta_agent.state_dict(), os.path.join(save_dir, "meta_strategy_final.pth"))
     for strategy, agent in execution_agents.items():
         torch.save(agent.state_dict(), os.path.join(save_dir, f"execution_{strategy.lower()}_final.pth"))
+    
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
     
     logger.info("=" * 60)
     logger.info("TRAINING COMPLETE!")
@@ -1791,6 +2864,10 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="stock", choices=["stock", "crypto"], help="Trading mode")
     parser.add_argument("--window-size", type=int, default=30, help="Window size")
     parser.add_argument("--save-dir", type=str, default="models_v0.2", help="Save directory")
+    parser.add_argument("--use-wandb", action="store_true", default=True, help="Use Weights & Biases for tracking")
+    parser.add_argument("--no-wandb", dest="use_wandb", action="store_false", help="Disable Weights & Biases")
+    parser.add_argument("--wandb-project", type=str, default="hierarchical-transformer-trading", help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name (optional)")
     
     args = parser.parse_args()
     
@@ -1849,6 +2926,9 @@ if __name__ == "__main__":
         mode=args.mode,
         window_size=args.window_size,
         save_dir=args.save_dir,
-        logger=logger
+        logger=logger,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity
     )
 

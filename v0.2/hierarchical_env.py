@@ -420,6 +420,7 @@ class MetaStrategyEnv(gym.Env):
         total_reward = 0.0
         done = False
         truncated = False
+        hard_stop_loss_triggered = False  # Track if hard stop-loss was triggered
         
         execution_env = self.execution_envs[selected_strategy]
         
@@ -622,7 +623,8 @@ class MetaStrategyEnv(gym.Env):
             'regime': regime,
             'balance': self.current_balance,
             'return_pct': return_pct if self.initial_balance > 0 else 0.0,
-            'execution_reward': total_reward
+            'execution_reward': total_reward,
+            'hard_stop_loss': hard_stop_loss_triggered  # Pass hard stop-loss flag to training code
         }
         
         # Add trade info if available

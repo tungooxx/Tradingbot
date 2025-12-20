@@ -49,6 +49,10 @@ class TradingConstraintsEnv(gym.Wrapper):
         self.position_size_pct = position_size_pct
         self.logger = logger or logging.getLogger("TradingConstraintsEnv")
         
+        # Expose base environment attributes (needed for training)
+        # These are set after base_env is fully initialized
+        # We'll use property accessors to ensure they're always available
+        
         # Track open positions
         self.open_positions = []  # List of entry prices/timestamps
         
@@ -62,6 +66,66 @@ class TradingConstraintsEnv(gym.Wrapper):
         self.logger.info(f"  Min confidence: {min_confidence:.0%}")
         self.logger.info(f"  Max positions: {max_positions}")
         self.logger.info(f"  Position size: {position_size_pct:.0%}")
+    
+    @property
+    def obs_shape(self):
+        """Get observation shape from base environment"""
+        return self.env.obs_shape
+    
+    @property
+    def observation_space(self):
+        """Get observation space from base environment"""
+        return self.env.observation_space
+    
+    @property
+    def action_space(self):
+        """Get action space from base environment"""
+        return self.env.action_space
+    
+    @property
+    def data(self):
+        """Get data from base environment"""
+        return self.env.data
+    
+    @property
+    def df(self):
+        """Get dataframe from base environment"""
+        return self.env.df
+    
+    @property
+    def window_size(self):
+        """Get window size from base environment"""
+        return self.env.window_size
+    
+    @property
+    def current_step(self):
+        """Get current step from base environment"""
+        return self.env.current_step
+    
+    @property
+    def max_steps(self):
+        """Get max steps from base environment"""
+        return self.env.max_steps
+    
+    @property
+    def balance(self):
+        """Get balance from base environment"""
+        return self.env.balance
+    
+    @property
+    def shares(self):
+        """Get shares from base environment"""
+        return self.env.shares
+    
+    @property
+    def entry_price(self):
+        """Get entry price from base environment"""
+        return self.env.entry_price
+    
+    @property
+    def initial_balance(self):
+        """Get initial balance from base environment"""
+        return self.env.initial_balance
     
     def get_action_confidence(self, action_probs: np.ndarray) -> float:
         """Get confidence for the selected action"""
@@ -103,6 +167,16 @@ class TradingConstraintsEnv(gym.Wrapper):
                 reward -= 0.01  # Penalty for trying to exceed max positions
                 info['action_blocked'] = 'max_positions'
                 info['original_action'] = 'BUY'
+                # Ensure reward_breakdown exists (base env should provide it, but ensure it's there)
+                if 'reward_breakdown' not in info:
+                    info['reward_breakdown'] = {
+                        'action_type': 'HOLD',
+                        'action_reward': reward,
+                        'holding_reward': 0.0,
+                        'stop_loss_reward': 0.0,
+                        'take_profit_reward': 0.0
+                    }
+                info['executed_action'] = 'HOLD'
                 return obs, reward, done, truncated, info
             
             if self.last_action_confidence < self.min_confidence:
@@ -115,6 +189,16 @@ class TradingConstraintsEnv(gym.Wrapper):
                 info['action_blocked'] = 'low_confidence'
                 info['original_action'] = 'BUY'
                 info['confidence'] = self.last_action_confidence
+                # Ensure reward_breakdown exists
+                if 'reward_breakdown' not in info:
+                    info['reward_breakdown'] = {
+                        'action_type': 'HOLD',
+                        'action_reward': reward,
+                        'holding_reward': 0.0,
+                        'stop_loss_reward': 0.0,
+                        'take_profit_reward': 0.0
+                    }
+                info['executed_action'] = 'HOLD'
                 return obs, reward, done, truncated, info
             
             # Apply position sizing constraint: limit balance to position_size_pct
@@ -137,6 +221,16 @@ class TradingConstraintsEnv(gym.Wrapper):
                 reward -= 0.001  # Small penalty
                 info['action_blocked'] = 'no_position'
                 info['original_action'] = 'SELL'
+                # Ensure reward_breakdown exists
+                if 'reward_breakdown' not in info:
+                    info['reward_breakdown'] = {
+                        'action_type': 'HOLD',
+                        'action_reward': reward,
+                        'holding_reward': 0.0,
+                        'stop_loss_reward': 0.0,
+                        'take_profit_reward': 0.0
+                    }
+                info['executed_action'] = 'HOLD'
                 return obs, reward, done, truncated, info
         
         # Execute constrained action
@@ -214,3 +308,4 @@ def create_constrained_env(
         logger=logger
     )
     return constrained_env
+

@@ -129,7 +129,21 @@ class ExecutionAgent(nn.Module):
         # Strategy-specific features (position state, etc.)
         strategy_feat_dim = 3  # shares > 0, shares == 0, entry_price_normalized
         
-        combined_dim = transformer_dim + cross_attention_dim + strategy_feat_dim
+        # Precision features: Vision (Transformer) + Precision (Scaled Price features)
+        # 1. Current hourly return (normalized)
+        # 2. RSI (scaled 0 to 1)
+        # 3. Position Status (0 or 1)
+        # 4. Unrealized PnL (normalized)
+        precision_feat_dim = 4  # hourly_return, rsi, position_status, unrealized_pnl
+        
+        # HYBRID INPUT: Local Features from Environment (4 features)
+        # 1. Position Status (0 or 1)
+        # 2. Unrealized PnL (scaled by 10)
+        # 3. Time in Trade (normalized by window size)
+        # 4. Relative Price (relative to 20-period MA)
+        local_feat_dim = 4  # position_status, unrealized_pnl, time_in_trade, relative_price
+        
+        combined_dim = transformer_dim + cross_attention_dim + strategy_feat_dim + precision_feat_dim + local_feat_dim
         
         # Feature fusion
         self.feature_fusion = nn.Sequential(
@@ -207,21 +221,88 @@ class ExecutionAgent(nn.Module):
         
         return torch.tensor([has_position, no_position, price_ratio], dtype=torch.float32)
     
+    def _get_precision_features(self,
+                                features_dict: Dict[str, torch.Tensor],
+                                shares: float,
+                                entry_price: float,
+                                current_price: float) -> torch.Tensor:
+        """
+        Get precision features: Vision (Transformer) + Precision (Scaled Price).
+        
+        Args:
+            features_dict: Dictionary of multi-scale features (to extract RSI)
+            shares: Current position size
+            entry_price: Entry price
+            current_price: Current price
+        
+        Returns:
+            Precision features (4,): [hourly_return, rsi, position_status, unrealized_pnl]
+        """
+        # 1. Current hourly return (normalized)
+        # Extract from 1h features if available, otherwise use 1d
+        hourly_return = 0.0
+        if "1h" in features_dict:
+            # Get last timestep of 1h features (feature 2 = log returns)
+            last_1h = features_dict["1h"][:, -1, :]  # (batch, features)
+            if last_1h.shape[1] > 2:
+                hourly_return = last_1h[0, 2].item()  # Feature 2 = log returns
+        elif "1d" in features_dict:
+            # Fallback to daily return
+            last_1d = features_dict["1d"][:, -1, :]
+            if last_1d.shape[1] > 2:
+                hourly_return = last_1d[0, 2].item() / 24.0  # Approximate hourly from daily
+        
+        # Normalize hourly return (clip to [-1, 1] range)
+        hourly_return = max(-1.0, min(1.0, hourly_return * 10.0))  # Scale and clip
+        
+        # 2. RSI (scaled 0 to 1)
+        # Extract from features (feature 3 = RSI)
+        rsi = 0.5  # Default neutral RSI
+        if "1h" in features_dict:
+            last_1h = features_dict["1h"][:, -1, :]
+            if last_1h.shape[1] > 3:
+                rsi_raw = last_1h[0, 3].item()  # Feature 3 = RSI
+                # RSI is already normalized to [0, 1] in preprocessing
+                rsi = max(0.0, min(1.0, rsi_raw))
+        elif "1d" in features_dict:
+            last_1d = features_dict["1d"][:, -1, :]
+            if last_1d.shape[1] > 3:
+                rsi_raw = last_1d[0, 3].item()
+                rsi = max(0.0, min(1.0, rsi_raw))
+        
+        # 3. Position Status (0 or 1)
+        position_status = 1.0 if shares > 0 else 0.0
+        
+        # 4. Unrealized PnL (normalized)
+        if shares > 0 and entry_price > 0:
+            unrealized_pnl_pct = (current_price - entry_price) / entry_price
+            # Normalize to [-1, 1] range (clip extreme values)
+            unrealized_pnl = max(-1.0, min(1.0, unrealized_pnl_pct * 10.0))
+        else:
+            unrealized_pnl = 0.0
+        
+        return torch.tensor([hourly_return, rsi, position_status, unrealized_pnl], dtype=torch.float32)
+    
     def forward(self,
                 features_dict: Dict[str, torch.Tensor],
-                strategy_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                strategy_features: torch.Tensor,
+                precision_features: Optional[torch.Tensor] = None,
+                local_features: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass.
+        Forward pass with Hybrid Input: Vision (Transformer) + Precision + Local Features.
         
         Args:
             features_dict: Dictionary of multi-scale features
             strategy_features: Strategy-specific features (batch, 3)
+            precision_features: Optional precision features (batch, 4)
+            local_features: Optional local features from environment (batch, 4)
+                [position_status, unrealized_pnl, time_in_trade, relative_price]
         
         Returns:
             logits: Action logits (batch, 3)
             value: State value (batch, 1)
         """
-        # Encode multi-scale features
+        # Encode multi-scale features (Vision - Step 1 Transformer output)
         encoded = self.transformer_encoder(features_dict)
         
         # Get concatenated last hidden states
@@ -239,11 +320,25 @@ class ExecutionAgent(nn.Module):
         if torch.isnan(cross_features).any() or torch.isinf(cross_features).any():
             cross_features = replace_nan_preserve_grad(cross_features, replacement=0.0)
         
-        # Concatenate all features
+        # Precision features: If not provided, use default (will be calculated in training)
+        if precision_features is None:
+            # Default precision features (will be replaced in training loop)
+            batch_size = transformer_features.shape[0]
+            precision_features = torch.zeros(batch_size, 4, device=transformer_features.device, dtype=torch.float32)
+        
+        # HYBRID INPUT: Local Features from Environment
+        # If not provided, use default (will be passed from environment in training)
+        if local_features is None:
+            batch_size = transformer_features.shape[0]
+            local_features = torch.zeros(batch_size, 4, device=transformer_features.device, dtype=torch.float32)
+        
+        # Concatenate all features: Vision (Transformer) + Precision + Local Features
         combined = torch.cat([
-            transformer_features,
-            cross_features,
-            strategy_features
+            transformer_features,  # Vision: Transformer output (Step 1)
+            cross_features,         # Vision: Cross-scale attention
+            strategy_features,      # Strategy features
+            precision_features,     # Precision: hourly_return, rsi, position_status, unrealized_pnl
+            local_features          # Local: position_status, unrealized_pnl, time_in_trade, relative_price
         ], dim=1)
         
         if torch.isnan(combined).any() or torch.isinf(combined).any():
@@ -278,6 +373,8 @@ class ExecutionAgent(nn.Module):
     def act(self,
             features_dict: Dict[str, torch.Tensor],
             strategy_features: torch.Tensor,
+            precision_features: Optional[torch.Tensor] = None,
+            local_features: Optional[torch.Tensor] = None,
             deterministic: bool = False) -> Tuple[int, torch.Tensor, torch.Tensor]:
         """
         Select action (BUY/SELL/HOLD).
@@ -285,6 +382,8 @@ class ExecutionAgent(nn.Module):
         Args:
             features_dict: Multi-scale features
             strategy_features: Strategy features
+            precision_features: Optional precision features (hourly_return, rsi, position_status, unrealized_pnl)
+            local_features: Optional local features from environment (position_status, unrealized_pnl, time_in_trade, relative_price)
             deterministic: If True, select best action; if False, sample
         
         Returns:
@@ -292,15 +391,59 @@ class ExecutionAgent(nn.Module):
             log_prob: Log probability
             value: State value
         """
-        logits, value = self.forward(features_dict, strategy_features)
+        logits, value = self.forward(features_dict, strategy_features, precision_features, local_features)
         
         # Check for NaN in logits
         if torch.isnan(logits).any():
             # Replace NaN with uniform distribution
             logits = torch.ones_like(logits) / logits.shape[-1]
         
-        # Clamp logits to prevent extreme values
-        logits = torch.clamp(logits, min=-10, max=10)
+        # ============================================================
+        # ACTION MASKING + TEMPERATURE SCALING (CRITICAL FIX for Policy Collapse)
+        # ============================================================
+        # CRITICAL FIX: Apply temperature scaling BEFORE masking to prevent collapse
+        # Tighter clamping + temperature to keep probabilities reasonable
+        # ============================================================
+        LOGIT_CLAMP_MIN = -5.0   # Tighter: Prevent extreme values
+        LOGIT_CLAMP_MAX = +5.0   # Tighter: Keep probabilities reasonable
+        LOGIT_TEMPERATURE = 2.5  # Temperature scaling: Increased from 1.5 to 2.5 for stronger exploration
+        ACTION_MASK_VALUE = -5.0  # Within clamp range (was -20.0)
+        
+        # CRITICAL FIX: Apply temperature scaling FIRST to prevent extreme logits
+        logits = logits / LOGIT_TEMPERATURE
+        
+        # ACTION MASKING: Disable invalid actions
+        # local_features[:, 0] = position_status (1.0 if holding, 0.0 if cash)
+        # CRITICAL: This must work correctly or agent will select invalid actions!
+        if local_features is not None and local_features.numel() > 0:
+            position_status = local_features[:, 0] if local_features.dim() > 1 else local_features[0]
+            
+            # Create masks for each invalid action
+            # If position_status == 1.0 (in position): mask BUY (index 1)
+            # If position_status == 0.0 (no position): mask SELL (index 2)
+            batch_size = logits.shape[0]
+            
+            for i in range(batch_size):
+                pos = position_status[i].item() if position_status.dim() > 0 else position_status.item()
+                
+                # CRITICAL: Ensure position_status is valid (0.0 or 1.0)
+                if pos > 0.5:  # In position - mask BUY
+                    logits[i, 1] = ACTION_MASK_VALUE
+                    # DEBUG: Log if BUY was masked (only first few times to avoid spam)
+                    if not hasattr(self, '_mask_debug_count'):
+                        self._mask_debug_count = 0
+                    if self._mask_debug_count < 3:
+                        self._mask_debug_count += 1
+                else:  # No position - mask SELL
+                    logits[i, 2] = ACTION_MASK_VALUE
+        else:
+            # CRITICAL: If local_features is None or empty, action masking is DISABLED!
+            # This is a bug - we should always have local_features for proper masking
+            import warnings
+            warnings.warn(f"ACTION MASKING DISABLED: local_features is None or empty! Agent may select invalid actions!")
+        
+        # Clamp logits AFTER masking and temperature (tighter range)
+        logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
         
         dist = Categorical(logits=logits)
         
@@ -330,7 +473,9 @@ class ExecutionAgent(nn.Module):
     def evaluate(self,
                  features_dict: Dict[str, torch.Tensor],
                  strategy_features: torch.Tensor,
-                 actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                 actions: torch.Tensor,
+                 precision_features: Optional[torch.Tensor] = None,
+                 local_features: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Evaluate actions for training.
         
@@ -338,21 +483,47 @@ class ExecutionAgent(nn.Module):
             features_dict: Multi-scale features
             strategy_features: Strategy features
             actions: Selected actions (batch,)
+            precision_features: Optional precision features (hourly_return, rsi, position_status, unrealized_pnl)
+            local_features: Optional local features from environment (position_status, unrealized_pnl, time_in_trade, relative_price)
         
         Returns:
             log_probs: Log probabilities
             values: State values
             entropy: Distribution entropy
         """
-        logits, values = self.forward(features_dict, strategy_features)
+        logits, values = self.forward(features_dict, strategy_features, precision_features, local_features)
         
         # Check for NaN in logits
         if torch.isnan(logits).any():
             # Replace NaN with uniform distribution
             logits = torch.ones_like(logits) / logits.shape[-1]
         
-        # Clamp logits to prevent extreme values
-        logits = torch.clamp(logits, min=-10, max=10)
+        # ============================================================
+        # ACTION MASKING (from Principal ML Engineer Audit)
+        # ============================================================
+        # Same parameters as act() for consistency
+        LOGIT_CLAMP_MIN = -5.0   # Tighter: Match act() method
+        LOGIT_CLAMP_MAX = +5.0    # Tighter: Match act() method
+        LOGIT_TEMPERATURE = 1.5  # Temperature scaling: Match act() method
+        ACTION_MASK_VALUE = -5.0  # Within clamp range (was -20.0)
+        
+        # CRITICAL FIX: Apply temperature scaling FIRST (match act() method)
+        logits = logits / LOGIT_TEMPERATURE
+        
+        # ACTION MASKING: Apply same masking as in act() for consistent log_probs
+        if local_features is not None and local_features.numel() > 0:
+            position_status = local_features[:, 0] if local_features.dim() > 1 else local_features[0]
+            
+            batch_size = logits.shape[0]
+            for i in range(batch_size):
+                pos = position_status[i].item() if position_status.dim() > 0 else position_status.item()
+                if pos > 0.5:  # In position - mask BUY
+                    logits[i, 1] = ACTION_MASK_VALUE
+                else:  # No position - mask SELL
+                    logits[i, 2] = ACTION_MASK_VALUE
+        
+        # Clamp logits AFTER masking and temperature (tighter range)
+        logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
         
         # Check for NaN in values
         if torch.isnan(values).any():

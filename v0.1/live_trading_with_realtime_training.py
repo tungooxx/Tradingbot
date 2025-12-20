@@ -366,7 +366,9 @@ class LiveTradingWithRealtimeTraining:
     def _calculate_reward_from_trade(self, signal: Dict, executed: bool, pnl: Optional[float] = None) -> float:
         """Calculate reward from trade outcome"""
         if not executed:
-            return -0.001  # Small penalty for not executing
+            # No penalty for not executing - model should wait for good opportunities
+            # The environment's reward function already handles HOLD actions
+            return 0.0  # Neutral reward for not executing
         
         if pnl is None:
             # Use signal confidence as proxy reward
@@ -537,22 +539,27 @@ class LiveTradingWithRealtimeTraining:
                 logger.info(f"Signal confidence {signal['confidence']:.2%} below threshold {self.min_confidence:.0%}, skipping")
             
             # Step environment to get next state
+            # The environment's reward function handles all rewards (including HOLD)
             next_obs, reward, done, truncated, info = self.env.step(action, action_confidence=action_confidence)
             
-            # Calculate reward from trade outcome
-            trade_reward = self._calculate_reward_from_trade(signal, executed, pnl)
+            # Use environment reward directly (it already handles HOLD/BUY/SELL properly)
+            # Only add trade-specific bonus if trade was executed
+            if executed and pnl is not None:
+                # Add small bonus/penalty based on actual P&L
+                pnl_reward = pnl / 100.0  # Scale P&L to reward (e.g., $100 profit = +1 reward)
+                reward += pnl_reward
             
             # Update performance tracking
-            self.total_reward += trade_reward
+            self.total_reward += reward
             if pnl is not None:
                 self.total_profit += pnl
                 self.total_trades_executed += 1
             
-            # Collect experience
+            # Collect experience (use environment reward, not separate trade_reward)
             self.collect_experience(
                 state=self.current_state,
                 action=action,
-                reward=trade_reward,
+                reward=reward,  # Use environment reward (already includes trade bonuses)
                 next_state=next_obs,
                 done=done,
                 info=info
@@ -693,7 +700,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="stock", choices=["stock", "crypto"], help="Trading mode")
     parser.add_argument("--interval", type=str, default="1d", help="Data interval")
     parser.add_argument("--model", type=str, default="kan_agent_stock.pth", help="Model path")
-    parser.add_argument("--window-size", type=int, default=72, help="Window size")
+    parser.add_argument("--window-size", type=int, default=30, help="Window size")
     parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension")
     parser.add_argument("--min-confidence", type=float, default=0.50, help="Min confidence")
     parser.add_argument("--max-positions", type=int, default=3, help="Max positions")
@@ -719,3 +726,4 @@ if __name__ == "__main__":
     )
     
     bot.run_continuous(check_interval_minutes=args.check_interval)
+

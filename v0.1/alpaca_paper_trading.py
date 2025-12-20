@@ -59,8 +59,8 @@ class AlpacaPaperTradingBot:
     """Automated paper trading bot using Alpaca API"""
     
     def __init__(self, ticker: str, model_path: str, mode: str = "stock",
-                 interval: str = "1d", window_size: int = 30,
-                 min_confidence: float = 0.70, max_positions: int = 3,
+                 interval: str = "1d", window_size: int = 72,
+                 min_confidence: float = 0.30, max_positions: int = 3,
                  position_size_pct: float = 0.10):
         """
         Initialize paper trading bot
@@ -116,8 +116,11 @@ class AlpacaPaperTradingBot:
         """Load trained model"""
         try:
             # Get observation dimension (from training)
-            obs_dim = 150  # window_size * features (30 * 5)
+            # Must match training: window_size * features
+            # Default: 72 * 5 = 360 for stocks
+            obs_dim = self.window_size * 5  # 5 features: Close, Log_Ret, Volume, RSI_14, MACD_12_26_9
             action_dim = 3  # skip, buy, sell
+            logger.info(f"Model observation dimension: {obs_dim} (window_size={self.window_size} * 5 features)")
             
             # Extract hidden_dim from model filename if available
             import re
@@ -642,7 +645,8 @@ def main():
     parser.add_argument('--model', type=str, required=True, help='Path to model file')
     parser.add_argument('--mode', type=str, default='stock', choices=['stock', 'crypto'], help='Trading mode')
     parser.add_argument('--interval', type=str, default='1d', help='Data interval')
-    parser.add_argument('--confidence', type=float, default=0.70, help='Min confidence threshold (0.0-1.0)')
+    parser.add_argument('--window-size', type=int, default=72, help='Lookback window size (must match training, default: 72 for stocks)')
+    parser.add_argument('--confidence', type=float, default=0.30, help='Min confidence threshold (0.0-1.0) - matches training default')
     parser.add_argument('--max-positions', type=int, default=3, help='Max concurrent positions')
     parser.add_argument('--position-size', type=float, default=0.10, help='Position size as % of buying power')
     parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
@@ -665,6 +669,7 @@ def main():
         model_path=args.model,
         mode=args.mode,
         interval=args.interval,
+        window_size=args.window_size,  # Default 72 to match training
         min_confidence=args.confidence,
         max_positions=args.max_positions,
         position_size_pct=args.position_size
