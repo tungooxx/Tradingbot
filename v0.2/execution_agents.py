@@ -287,7 +287,8 @@ class ExecutionAgent(nn.Module):
                 features_dict: Dict[str, torch.Tensor],
                 strategy_features: torch.Tensor,
                 precision_features: Optional[torch.Tensor] = None,
-                local_features: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                local_features: Optional[torch.Tensor] = None,
+                return_weights: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass with Hybrid Input: Vision (Transformer) + Precision + Local Features.
         
@@ -296,11 +297,12 @@ class ExecutionAgent(nn.Module):
             strategy_features: Strategy-specific features (batch, 3)
             precision_features: Optional precision features (batch, 4)
             local_features: Optional local features from environment (batch, 4)
-                [position_status, unrealized_pnl, time_in_trade, relative_price]
+            return_weights: If True, also return attention weights
         
         Returns:
             logits: Action logits (batch, 3)
             value: State value (batch, 1)
+            attn_weights: (nhead, num_scales, batch, num_scales) if return_weights else None
         """
         # Encode multi-scale features (Vision - Step 1 Transformer output)
         encoded = self.transformer_encoder(features_dict)
@@ -308,15 +310,17 @@ class ExecutionAgent(nn.Module):
         # Get concatenated last hidden states
         transformer_features = self.transformer_encoder.get_last_hidden_state(encoded)
         
-        # DEBUG: Check for NaN/Inf in intermediate outputs
         # CRITICAL: Use gradient-preserving replacement to maintain computation graph!
-        # torch.nan_to_num() breaks gradients - use replace_nan_preserve_grad() instead
         if torch.isnan(transformer_features).any() or torch.isinf(transformer_features).any():
             transformer_features = replace_nan_preserve_grad(transformer_features, replacement=0.0)
         
         # Cross-scale attention
-        cross_features = self.cross_attention(encoded)
-        
+        if return_weights:
+            cross_features, attn_weights = self.cross_attention(encoded, return_weights=True)
+        else:
+            cross_features = self.cross_attention(encoded, return_weights=False)
+            attn_weights = None
+            
         if torch.isnan(cross_features).any() or torch.isinf(cross_features).any():
             cross_features = replace_nan_preserve_grad(cross_features, replacement=0.0)
         
@@ -368,6 +372,8 @@ class ExecutionAgent(nn.Module):
         if torch.isnan(value).any() or torch.isinf(value).any():
             value = replace_nan_preserve_grad(value, replacement=0.0)
         
+        if return_weights:
+            return logits, value, attn_weights
         return logits, value
     
     def act(self,
@@ -404,10 +410,10 @@ class ExecutionAgent(nn.Module):
         # CRITICAL FIX: Apply temperature scaling BEFORE masking to prevent collapse
         # Tighter clamping + temperature to keep probabilities reasonable
         # ============================================================
-        LOGIT_CLAMP_MIN = -5.0   # Tighter: Prevent extreme values
-        LOGIT_CLAMP_MAX = +5.0   # Tighter: Keep probabilities reasonable
-        LOGIT_TEMPERATURE = 2.5  # Temperature scaling: Increased from 1.5 to 2.5 for stronger exploration
-        ACTION_MASK_VALUE = -5.0  # Within clamp range (was -20.0)
+        LOGIT_CLAMP_MIN = -20.0  # Allow mask to be effective
+        LOGIT_CLAMP_MAX = +20.0
+        LOGIT_TEMPERATURE = 1.0  # Default to 1.0
+        ACTION_MASK_VALUE = -1e10  # STRONG MASK
         
         # CRITICAL FIX: Apply temperature scaling FIRST to prevent extreme logits
         logits = logits / LOGIT_TEMPERATURE
@@ -470,6 +476,80 @@ class ExecutionAgent(nn.Module):
             # Batch mode: return first element for single action
             return action[0].item(), log_prob[0], value_scalar
     
+    def get_action_and_value(self,
+                             features_dict: Dict[str, torch.Tensor],
+                             strategy_features: torch.Tensor,
+                             precision_features: Optional[torch.Tensor] = None,
+                             local_features: Optional[torch.Tensor] = None,
+                             deterministic: bool = False,
+                             return_weights: bool = False,
+                             return_logits: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Helper for telemetry to get action, log_prob, entropy, and value in one pass.
+        
+        Args:
+            features_dict: Multi-scale features
+            strategy_features: Strategy features
+            precision_features: Precision features
+            local_features: Local features
+            deterministic: If True, select best action
+            return_weights: If True, also return attention weights
+            return_logits: If True, also return masked logits used for action selection
+            
+        Returns:
+            action, log_prob, entropy, value, (attn_weights if return_weights else None[, logits if return_logits])
+        """
+        if return_weights:
+            logits, values, attn_weights = self.forward(features_dict, strategy_features, precision_features, local_features, return_weights=True)
+        else:
+            logits, values = self.forward(features_dict, strategy_features, precision_features, local_features, return_weights=False)
+            attn_weights = None
+            
+        # Numerical stability: clamp logits
+        logits = torch.clamp(logits, min=-20.0, max=20.0)
+        
+        # Apply ACTION MASKING in get_action_and_value (CRITICAL for telemetry and training consistency)
+        if local_features is not None and local_features.numel() > 0:
+            position_status = local_features[:, 0]
+            batch_size = logits.shape[0]
+            mask_val = -1e10
+            for i in range(batch_size):
+                pos = position_status[i].item() if position_status.dim() > 0 else position_status.item()
+                if pos > 0.5:  # In position - mask BUY
+                    logits[i, 1] = mask_val
+                else:  # No position - mask SELL
+                    logits[i, 2] = mask_val
+
+        dist = Categorical(logits=logits)
+        
+        if deterministic:
+            action = torch.argmax(logits, dim=1)
+        else:
+            action = dist.sample()
+            
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        if return_weights and attn_weights is not None:
+            # attn_weights shape: (batch, nhead, num_scales, num_scales)
+            # 3. CRITICAL FIX: Correctly average the weights
+            # Average across Heads (dim 1) -> Result: (batch, num_scales, num_scales)
+            avg_heads = attn_weights.mean(dim=1)
+            
+            # Average across Query Scales (dim 1) -> Result: (batch, num_scales)
+            # This represents: "For this batch item, how much focus is on Col 0 vs Col 1 vs Col 2"
+            final_weights = avg_heads.mean(dim=1)
+            
+            if return_logits:
+                return action, log_prob, entropy, values.squeeze(-1), final_weights, logits
+            else:
+                return action, log_prob, entropy, values.squeeze(-1), final_weights
+            
+        if return_logits:
+            return action, log_prob, entropy, values.squeeze(-1), logits
+        else:
+            return action, log_prob, entropy, values.squeeze(-1)
+
     def evaluate(self,
                  features_dict: Dict[str, torch.Tensor],
                  strategy_features: torch.Tensor,
@@ -502,10 +582,10 @@ class ExecutionAgent(nn.Module):
         # ACTION MASKING (from Principal ML Engineer Audit)
         # ============================================================
         # Same parameters as act() for consistency
-        LOGIT_CLAMP_MIN = -5.0   # Tighter: Match act() method
-        LOGIT_CLAMP_MAX = +5.0    # Tighter: Match act() method
-        LOGIT_TEMPERATURE = 1.5  # Temperature scaling: Match act() method
-        ACTION_MASK_VALUE = -5.0  # Within clamp range (was -20.0)
+        LOGIT_CLAMP_MIN = -20.0
+        LOGIT_CLAMP_MAX = +20.0
+        LOGIT_TEMPERATURE = 1.0
+        ACTION_MASK_VALUE = -1e10
         
         # CRITICAL FIX: Apply temperature scaling FIRST (match act() method)
         logits = logits / LOGIT_TEMPERATURE
@@ -602,15 +682,43 @@ def test_execution_agents():
     }
     strategy_feat = torch.tensor([[1., 0., 1.05], [0., 1., 1.0]])  # Position state
     
-    logits, value = agent(features, strategy_feat)
-    print(f"Logits shape: {logits.shape}, Value shape: {value.shape}")
+    logit_val, value_val = agent(features, strategy_feat)
+    print(f"Logits shape: {logit_val.shape}, Value shape: {value_val.shape}")
     
     action, log_prob, val = agent.act(features, strategy_feat, deterministic=True)
     action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
-    print(f"Action: {action_map.get(action, action)}, Log prob: {log_prob.item():.4f}, Value: {val.item():.4f}")
+    
+    # Handle scalar vs tensor
+    log_prob_val = log_prob.item() if hasattr(log_prob, 'item') else log_prob
+    val_val = val.item() if hasattr(val, 'item') else val
+    
+    print(f"Action: {action_map.get(action, action)}, Log prob: {log_prob_val:.4f}, Value: {val_val:.4f}")
     
     confidence = agent.get_action_confidence(features, strategy_feat)
     print(f"Confidence: {confidence}")
+    
+    # NEW TEST: Verify get_action_and_value with attention weights
+    print("\n1b. Testing get_action_and_value (Telemetry Mode)...")
+    # Need dummy precision and local features
+    precision_feat = torch.zeros(2, 4)
+    local_feat = torch.zeros(2, 4)
+    
+    # Call with return_weights=True
+    act, logp, ent, val, weights = agent.get_action_and_value(
+        features, strategy_feat, precision_feat, local_feat, 
+        deterministic=True, return_weights=True
+    )
+    print(f"Action: {act}, LogProb: {logp.shape}, Weights: {weights.shape if weights is not None else 'None'}")
+    
+    if weights is not None:
+        # Expected shape: (Batch=2, NumScales=2)
+        print(f"Attention Weights Shape: {weights.shape}")
+        if weights.shape == (2, 2):
+            print("✅ Attention weights shape is correct: (Batch, NumScales)")
+        else:
+            print(f"❌ Attention weights shape mismatch! Expected (2, 2), got {weights.shape}")
+    else:
+        print("❌ Attention weights returned None!")
     
     # Test all agents
     print("\n2. Testing all execution agents...")

@@ -102,19 +102,20 @@ class MetaStrategyAgent(nn.Module):
     
     def forward(self, 
                 features_dict: Dict[str, torch.Tensor],
-                regime_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                regime_features: torch.Tensor,
+                return_weights: bool = False) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass.
         
         Args:
             features_dict: Dictionary of multi-scale features
-                - Keys: "1h", "4h", "1d" (crypto) or "1d", "1w" (stock)
-                - Values: (batch, seq_len, input_dim)
             regime_features: Regime one-hot encoding (batch, 4)
+            return_weights: If True, also return attention weights
         
         Returns:
             logits: Strategy logits (batch, 4)
             value: State value (batch, 1)
+            attn_weights: (nhead, num_scales, batch, num_scales) if return_weights else None
         """
         # Encode multi-scale features
         encoded = self.transformer_encoder(features_dict)  # Dict of (batch, seq_len, d_model)
@@ -123,8 +124,12 @@ class MetaStrategyAgent(nn.Module):
         transformer_features = self.transformer_encoder.get_last_hidden_state(encoded)  # (batch, num_scales * d_model)
         
         # Cross-scale attention
-        cross_features = self.cross_attention(encoded)  # (batch, d_model)
-        
+        if return_weights:
+            cross_features, attn_weights = self.cross_attention(encoded, return_weights=True)
+        else:
+            cross_features = self.cross_attention(encoded, return_weights=False)
+            attn_weights = None
+            
         # Concatenate all features
         combined = torch.cat([
             transformer_features,  # (batch, num_scales * d_model)
@@ -139,6 +144,8 @@ class MetaStrategyAgent(nn.Module):
         logits = self.actor_head(fused)  # (batch, 4)
         value = self.critic_head(fused)  # (batch, 1)
         
+        if return_weights:
+            return logits, value, attn_weights
         return logits, value
     
     def act(self, 
@@ -190,6 +197,51 @@ class MetaStrategyAgent(nn.Module):
             # Batch mode: return first element for single action
             return action[0].item(), log_prob[0], value_scalar
     
+    def get_action_and_value(self, 
+                             features_dict: Dict[str, torch.Tensor],
+                             regime_features: torch.Tensor,
+                             deterministic: bool = False,
+                             return_weights: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Helper for telemetry to get action, log_prob, entropy, and value in one pass.
+        
+        Args:
+            features_dict: Multi-scale features
+            regime_features: Regime features
+            deterministic: If True, select best strategy
+            return_weights: If True, also return attention weights
+            
+        Returns:
+            action, log_prob, entropy, value, (attn_weights if return_weights else None)
+        """
+        if return_weights:
+            logits, values, attn_weights = self.forward(features_dict, regime_features, return_weights=True)
+        else:
+            logits, values = self.forward(features_dict, regime_features, return_weights=False)
+            attn_weights = None
+        
+        # Numerical stability: clamp logits
+        logits = torch.clamp(logits, min=-10, max=10)
+        
+        dist = Categorical(logits=logits)
+        
+        if deterministic:
+            action = torch.argmax(logits, dim=1)
+        else:
+            action = dist.sample()
+            
+        if return_weights and attn_weights is not None:
+            # attn_weights shape: (batch, nhead, num_scales, num_scales)
+            # 1. Average across Heads (dim 1) -> (batch, num_scales, num_scales)
+            avg_heads = attn_weights.mean(dim=1)
+            # 2. Average across Query Scales (dim 1) -> (batch, num_scales)
+            # This tells us: "On average, how much did the model look at 1h vs 4h vs 1d?"
+            final_weights = avg_heads.mean(dim=1)
+            
+            return action, log_prob, entropy, values.squeeze(-1), final_weights
+            
+        return action, log_prob, entropy, values.squeeze(-1)
+
     def evaluate(self, 
                  features_dict: Dict[str, torch.Tensor],
                  regime_features: torch.Tensor,

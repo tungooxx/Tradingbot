@@ -29,13 +29,17 @@ class EnhancedRegimeDetector:
         """
         self.window = window
         self.logger = logger or logging.getLogger(__name__)
-        # Store historical volatilities for proper threshold calculation
-        self.volatility_history = []
-        self.max_history = 1000  # Keep last 1000 volatility readings
+        # Store historical metrics for dynamic threshold calculation
+        self.history = {
+            'trend': [],
+            'mr': [],
+            'vol': []
+        }
+        self.max_history = 1000  # Keep last 1000 readings
     
     def detect_regime(self, prices: np.ndarray) -> int:
         """
-        Detect current market regime from price series.
+        Detect current market regime from price series using dynamic thresholds.
         
         Args:
             prices: Price array (Close prices)
@@ -55,26 +59,18 @@ class EnhancedRegimeDetector:
         if len(returns) == 0:
             return 0
         
-        # 1. Trend strength (ADX-like)
-        # Calculate directional movement
+        # 1. Trend strength (UP/DOWN imbalance)
         price_changes = np.diff(recent_prices)
         up_moves = np.where(price_changes > 0, price_changes, 0)
         down_moves = np.where(price_changes < 0, -price_changes, 0)
-        
         avg_up = np.mean(up_moves) if len(up_moves) > 0 else 0
         avg_down = np.mean(down_moves) if len(down_moves) > 0 else 0
+        trend_strength = abs(avg_up - avg_down) / (avg_up + avg_down + 1e-8) if (avg_up + avg_down) > 0 else 0
         
-        # Trend strength
-        if avg_up + avg_down > 0:
-            trend_strength = abs(avg_up - avg_down) / (avg_up + avg_down + 1e-8)
-        else:
-            trend_strength = 0
-        
-        # 2. Volatility
+        # 2. Volatility (Standard Deviation of log returns)
         volatility = np.std(returns) if len(returns) > 0 else 0
         
-        # 3. Mean reversion strength (Hurst-like)
-        # Calculate autocorrelation
+        # 3. Mean reversion strength (Negative Autocorrelation)
         autocorr = 0
         if len(returns) > 1:
             try:
@@ -82,45 +78,46 @@ class EnhancedRegimeDetector:
                 if corr_matrix.shape == (2, 2) and not np.isnan(corr_matrix[0, 1]):
                     autocorr = corr_matrix[0, 1]
             except:
-                autocorr = 0
+                pass
+        mean_reversion_strength = -autocorr
         
-        mean_reversion_strength = -autocorr  # Negative autocorr = mean reverting
+        # Update History
+        self.history['trend'].append(trend_strength)
+        self.history['mr'].append(mean_reversion_strength)
+        self.history['vol'].append(volatility)
         
-        # 4. Momentum
-        momentum = np.mean(returns) if len(returns) > 0 else 0
+        for k in self.history:
+            if len(self.history[k]) > self.max_history:
+                self.history[k].pop(0)
         
-        # Regime classification
-        # FIX: Store volatility in history for proper threshold calculation
-        self.volatility_history.append(volatility)
-        if len(self.volatility_history) > self.max_history:
-            self.volatility_history.pop(0)
+        # Dynamic Thresholds (Rolling Quantiles)
+        # Handle cases with insufficient history
+        if len(self.history['vol']) < 20:
+            # Static fallbacks until enough history accumulates
+            if volatility > 0.02: return 3 # RISK_OFF
+            if trend_strength > 0.6: return 0 # TREND_FOLLOW
+            if mean_reversion_strength > 0.4: return 1 # MEAN_REVERT
+            return 2 # MOMENTUM
         
-        # FIX: Calculate threshold from historical volatilities, not single value
-        if len(self.volatility_history) >= 20:  # Need at least 20 samples
-            vol_threshold = np.percentile(self.volatility_history, 70)
-        else:
-            # Fallback: use 70% of current volatility if no history
-            vol_threshold = volatility * 0.7 if volatility > 0 else 0.02
+        # Calculate thresholds
+        trend_thresh = np.nanpercentile(self.history['trend'], 70)
+        mr_thresh = np.nanpercentile(self.history['mr'], 70)
+        vol_thresh = np.nanpercentile(self.history['vol'], 80) # High bar for Risk-Off
         
-        # RISK_OFF: High volatility (only if significantly above historical 70th percentile)
-        # Use 1.5x multiplier to avoid triggering too easily
-        if volatility > vol_threshold * 1.5:
-            return 3  # RISK_OFF
-        
-        # TREND_FOLLOW: Strong trend, low mean reversion
-        if trend_strength > 0.6 and mean_reversion_strength < 0.3:
-            return 0  # TREND_FOLLOW
-        
-        # MEAN_REVERT: Strong mean reversion
-        if mean_reversion_strength > 0.5:
-            return 1  # MEAN_REVERT
-        
-        # MOMENTUM: Strong momentum
-        if abs(momentum) > 0.01:
-            return 2  # MOMENTUM
-        
-        # Default: TREND_FOLLOW
-        return 0
+        # 1. Check Risk-Off First (Priority)
+        if volatility > vol_thresh:
+            return 3 # RISK_OFF
+
+        # 2. Check Trend
+        if trend_strength > trend_thresh:
+            return 0 # TREND_FOLLOW
+
+        # 3. Check Mean Reversion
+        if mean_reversion_strength > mr_thresh:
+            return 1 # MEAN_REVERT
+
+        # 4. Default to Momentum
+        return 2
     
     def get_regime_features(self, prices: np.ndarray) -> np.ndarray:
         """

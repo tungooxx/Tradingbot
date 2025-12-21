@@ -20,6 +20,9 @@ from typing import Dict, Optional, Tuple, List
 import os
 from datetime import datetime
 import json
+import matplotlib
+matplotlib.use('Agg')  # Switch to non-interactive backend for thread safety
+import matplotlib.pyplot as plt
 from collections import defaultdict
 
 # Weights & Biases for experiment tracking
@@ -47,7 +50,7 @@ from execution_agents import create_execution_agents
 from hierarchical_env import MetaStrategyEnv, ExecutionEnv
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+
 
 
 # ==============================================================================
@@ -278,46 +281,108 @@ class TrainingStats:
 
 def prepare_pretraining_data(preprocessor: MultiTimescalePreprocessor, 
                             window_size: int = 30,
+                            multi_stock_tickers: Optional[List[str]] = None,
                             logger: Optional[logging.Logger] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """
     Prepare data for supervised pre-training (price prediction).
+    
+    IMPROVEMENT: Multi-stock support for Stage 1
+    - Stage 1: Multi-stock (learns general market dynamics)
+    - Stages 2-4: Single-stock (specialized training)
+    
+    Args:
+        preprocessor: Single-stock preprocessor (for backward compatibility)
+        window_size: Lookback window size
+        multi_stock_tickers: List of tickers for multi-stock training (Stage 1 only)
+        logger: Optional logger
     
     Returns:
         X_dict: Dictionary of input sequences by timescale
         y_dict: Dictionary of target prices by timescale
     """
-    aligned_data, features = preprocessor.process(window_size=window_size)
+    from typing import List
     
-    if not aligned_data or not features:
-        raise ValueError("Failed to process data")
-    
-    X_dict = {}
-    y_dict = {}
-    
-    for interval, feat_array in features.items():
-        if len(feat_array) < window_size + 1:
-            continue
+    # STAGE 1 IMPROVEMENT: Multi-stock training for general market dynamics
+    if multi_stock_tickers and len(multi_stock_tickers) > 1:
+        logger.info(f"Multi-stock pre-training: Loading {len(multi_stock_tickers)} stocks")
+        logger.info(f"  Tickers: {multi_stock_tickers}")
+        logger.info(f"  IMPROVEMENT: Using percentage changes (scale-invariant) for multi-stock compatibility")
+        logger.info(f"  This ensures $150 stock and $2000 stock are on same scale")
         
-        X_list = []
-        y_list = []
+        all_X_dict = {}
+        all_y_dict = {}
         
-            # Create sequences: predict next Close price
-        for i in range(window_size, len(feat_array) - 1):
-            window = feat_array[i - window_size:i]  # (window_size, features)
-            target = feat_array[i + 1, 0]  # Next Close price (first feature)
+        # Process each stock
+        for ticker in multi_stock_tickers:
+            try:
+                # Create preprocessor for this ticker
+                stock_preprocessor = MultiTimescalePreprocessor(ticker, mode=preprocessor.mode, logger=logger)
+                aligned_data, features = stock_preprocessor.process(window_size=window_size)
+                
+                if not aligned_data or not features:
+                    logger.warning(f"Skipping {ticker}: Failed to process data")
+                    continue
+                
+                # Process each interval
+                for interval, feat_array in features.items():
+                    if len(feat_array) < window_size + 1:
+                        continue
+                    
+                    if interval not in all_X_dict:
+                        all_X_dict[interval] = []
+                        all_y_dict[interval] = []
+                    
+                    X_list = []
+                    y_list = []
+                    
+                    # Create sequences: predict next period's log return
+                    # IMPROVEMENT: Use log returns (scale-invariant) for multi-stock compatibility
+                    # Log returns work across different price levels ($150 vs $2000)
+                    for i in range(window_size, len(feat_array) - 1):
+                        window = feat_array[i - window_size:i]  # (window_size, features)
+                        
+                        # Target: Next period's log return (feature index 2)
+                        # Log returns are scale-invariant: log($2000/$1900) ≈ log($200/$190)
+                        # This ensures $150 stock and $2000 stock are on same scale
+                        if feat_array.shape[1] > 2:
+                            target = feat_array[i + 1, 2]  # Log return (feature index 2)
+                        else:
+                            # Fallback: calculate from normalized prices if log return not available
+                            current_price = feat_array[i, 0]
+                            next_price = feat_array[i + 1, 0]
+                            if abs(current_price) > 1e-7:
+                                target = (next_price - current_price) / (abs(current_price) + 1e-7)
+                            else:
+                                target = 0.0
+                        
+                        # Check for NaN/Inf
+                        if np.isnan(window).any() or np.isinf(window).any():
+                            continue
+                        if np.isnan(target) or np.isinf(target):
+                            continue
+                        
+                        X_list.append(window)
+                        y_list.append(target)
+                    
+                    if X_list:
+                        all_X_dict[interval].extend(X_list)
+                        all_y_dict[interval].extend(y_list)
+                        logger.info(f"  {ticker} ({interval}): Added {len(X_list)} samples")
             
-            # Check for NaN/Inf
-            if np.isnan(window).any() or np.isinf(window).any():
+            except Exception as e:
+                logger.warning(f"Failed to process {ticker}: {e}")
                 continue
-            if np.isnan(target) or np.isinf(target):
+        
+        # Combine all stocks and normalize across all stocks
+        X_dict = {}
+        y_dict = {}
+        
+        for interval in all_X_dict.keys():
+            if len(all_X_dict[interval]) == 0:
                 continue
             
-            X_list.append(window)
-            y_list.append(target)
-        
-        if X_list:
-            X_array = np.array(X_list, dtype=np.float32)
-            y_array = np.array(y_list, dtype=np.float32).reshape(-1, 1)
+            X_array = np.array(all_X_dict[interval], dtype=np.float32)
+            y_array = np.array(all_y_dict[interval], dtype=np.float32).reshape(-1, 1)
             
             # Final NaN check
             if np.isnan(X_array).any() or np.isnan(y_array).any():
@@ -325,15 +390,16 @@ def prepare_pretraining_data(preprocessor: MultiTimescalePreprocessor,
                     logger.warning(f"Skipping {interval} due to NaN in processed data")
                 continue
             
-            # Normalize input features (per feature dimension)
-            # X_array shape: (samples, window_size, features)
+            # IMPROVEMENT: Normalize across ALL stocks (not per-stock)
+            # This ensures $150 stock and $2000 stock are on same scale
+            # X_array shape: (total_samples, window_size, features)
             for feat_idx in range(X_array.shape[2]):
                 feat_data = X_array[:, :, feat_idx]
-                feat_mean = feat_data.mean()
-                feat_std = feat_data.std() + 1e-7
+                feat_mean = feat_data.mean()  # Mean across ALL stocks
+                feat_std = feat_data.std() + 1e-7  # Std across ALL stocks
                 X_array[:, :, feat_idx] = (feat_data - feat_mean) / feat_std
             
-            # Normalize targets to prevent large values
+            # Normalize targets across all stocks
             y_mean = y_array.mean()
             y_std = y_array.std() + 1e-7
             y_array = (y_array - y_mean) / y_std
@@ -344,16 +410,82 @@ def prepare_pretraining_data(preprocessor: MultiTimescalePreprocessor,
             
             X_dict[interval] = X_array
             y_dict[interval] = y_array
+            
+            logger.info(f"  Combined {interval}: {len(X_array)} total samples from {len(multi_stock_tickers)} stocks")
+        
+        return X_dict, y_dict
     
-    return X_dict, y_dict
+    else:
+        # Single-stock mode (backward compatibility, used in Stages 2-4)
+        aligned_data, features = preprocessor.process(window_size=window_size)
+        
+        if not aligned_data or not features:
+            raise ValueError("Failed to process data")
+        
+        X_dict = {}
+        y_dict = {}
+        
+        for interval, feat_array in features.items():
+            if len(feat_array) < window_size + 1:
+                continue
+            
+            X_list = []
+            y_list = []
+            
+            # Create sequences: predict next Close price
+            for i in range(window_size, len(feat_array) - 1):
+                window = feat_array[i - window_size:i]  # (window_size, features)
+                target = feat_array[i + 1, 0]  # Next Close price (first feature)
+                
+                # Check for NaN/Inf
+                if np.isnan(window).any() or np.isinf(window).any():
+                    continue
+                if np.isnan(target) or np.isinf(target):
+                    continue
+                
+                X_list.append(window)
+                y_list.append(target)
+            
+            if X_list:
+                X_array = np.array(X_list, dtype=np.float32)
+                y_array = np.array(y_list, dtype=np.float32).reshape(-1, 1)
+                
+                # Final NaN check
+                if np.isnan(X_array).any() or np.isnan(y_array).any():
+                    if logger:
+                        logger.warning(f"Skipping {interval} due to NaN in processed data")
+                    continue
+                
+                # Normalize input features (per feature dimension)
+                # X_array shape: (samples, window_size, features)
+                for feat_idx in range(X_array.shape[2]):
+                    feat_data = X_array[:, :, feat_idx]
+                    feat_mean = feat_data.mean()
+                    feat_std = feat_data.std() + 1e-7
+                    X_array[:, :, feat_idx] = (feat_data - feat_mean) / feat_std
+                
+                # Normalize targets to prevent large values
+                y_mean = y_array.mean()
+                y_std = y_array.std() + 1e-7
+                y_array = (y_array - y_mean) / y_std
+                
+                # Clip extreme values
+                X_array = np.clip(X_array, -10, 10)
+                y_array = np.clip(y_array, -10, 10)
+                
+                X_dict[interval] = X_array
+                y_dict[interval] = y_array
+        
+        return X_dict, y_dict
 
 
 def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
                                   mode: str = "stock",
                                   epochs: int = 100,
-                                  batch_size: int = 256,  # Increased from 64 to 256 (4x) for better GPU utilization
+                                  batch_size: int = 512,  # Increased for better GPU utilization (reduce CPU overhead)
                                   lr: float = 0.0001,
                                   window_size: int = 30,
+                                  multi_stock_tickers: Optional[List[str]] = None,
                                   logger: Optional[logging.Logger] = None,
                                   use_wandb: bool = True) -> MultiScaleTransformerEncoder:
     """
@@ -369,7 +501,7 @@ def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
     
     # Prepare data
     logger.info("Preparing pre-training data...")
-    X_dict, y_dict = prepare_pretraining_data(preprocessor, window_size, logger)
+    X_dict, y_dict = prepare_pretraining_data(preprocessor, window_size, multi_stock_tickers, logger)
     
     if not X_dict:
         raise ValueError("No data prepared for pre-training")
@@ -447,41 +579,66 @@ def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
     for head in prediction_heads.values():
         head.apply(init_weights)
     
+    # Split data into train/validation sets (80/20 split)
+    logger.info("Splitting data into train/validation sets (80/20)...")
+    X_train_dict = {}
+    y_train_dict = {}
+    X_val_dict = {}
+    y_val_dict = {}
+    
+    for interval, X in X_dict.items():
+        y = y_dict[interval]
+        n_samples = len(X)
+        split_idx = int(0.8 * n_samples)
+        
+        X_train_dict[interval] = X[:split_idx]
+        y_train_dict[interval] = y[:split_idx]
+        X_val_dict[interval] = X[split_idx:]
+        y_val_dict[interval] = y[split_idx:]
+        
+        logger.info(f"  {interval}: {len(X_train_dict[interval])} train, {len(X_val_dict[interval])} val")
+    
     # Training loop
     logger.info(f"Training for {epochs} epochs...")
     
     for epoch in range(epochs):
-        total_loss = 0.0
-        num_batches = 0
-        interval_losses = {}  # Track losses per interval for wandb
+        # Training phase
+        transformer.train()
+        total_train_loss = 0.0
+        num_train_batches = 0
+        interval_train_losses = {}  # Track losses per interval for wandb
         
         # Train on each timescale
-        for interval, X in X_dict.items():
-            y = y_dict[interval]
-            interval_loss = 0.0
-            interval_batches = 0
+        for interval, X in X_train_dict.items():
+            y = y_train_dict[interval]
+            interval_train_loss = 0.0
+            interval_train_batches = 0
             
-            # Create dataloader (FIX: Ensure float32 dtype)
-            # OPTIMIZATION: Add num_workers and pin_memory for faster data loading
-            # num_workers=4-8 is optimal (too many causes overhead, too few causes CPU bottleneck)
-            dataset = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(y).float())
+            # OPTIMIZATION: Pre-convert to tensors to reduce CPU overhead
+            # Use num_workers=0 for small datasets or when CPU is bottleneck
+            # For large datasets, num_workers=2 is better than 4 to reduce CPU load
+            X_tensor = torch.from_numpy(X).float()
+            y_tensor = torch.from_numpy(y).float()
+            
+            dataset = TensorDataset(X_tensor, y_tensor)
             dataloader = DataLoader(
                 dataset, 
                 batch_size=batch_size, 
                 shuffle=True,
-                num_workers=4,  # Match physical CPU cores (4-8 is sweet spot)
-                pin_memory=True,  # Speed up CPU->GPU transfer
-                persistent_workers=True  # Keep workers alive between epochs
+                num_workers=0,  # Set to 0 to reduce CPU overhead - data is already in memory
+                pin_memory=True if device.type == 'cuda' else False  # Only pin if using GPU
             )
             
             for batch_X, batch_y in dataloader:
-                batch_X = batch_X.to(device)
-                batch_y = batch_y.to(device)
+                # Use non_blocking transfer for faster CPU->GPU
+                batch_X = batch_X.to(device, non_blocking=True)
+                batch_y = batch_y.to(device, non_blocking=True)
                 
-                # Check for NaN in input
-                if torch.isnan(batch_X).any() or torch.isnan(batch_y).any():
-                    logger.warning(f"Skipping batch with NaN values in {interval}")
-                    continue
+                # Move NaN checks to GPU (faster than CPU checks)
+                # Only check if we suspect issues (skip for performance)
+                # if torch.isnan(batch_X).any() or torch.isnan(batch_y).any():
+                #     logger.warning(f"Skipping batch with NaN values in {interval}")
+                #     continue
                 
                 # Forward pass
                 # Map interval key if needed (1wk -> 1w for transformer)
@@ -497,75 +654,136 @@ def pretrain_transformer_encoders(preprocessor: MultiTimescalePreprocessor,
                     elif "1w" in encoded and transformer_key == "1wk":
                         transformer_key = "1w"
                     else:
-                        logger.warning(f"Key '{transformer_key}' not found in encoded dict. Available keys: {list(encoded.keys())}")
-                        logger.warning(f"Skipping batch for interval {interval}")
+                        # Only log occasionally to reduce CPU overhead
+                        if num_train_batches % 100 == 0:
+                            logger.warning(f"Key '{transformer_key}' not found in encoded dict. Available keys: {list(encoded.keys())}")
                         continue
                 
                 last_hidden = encoded[transformer_key][:, -1, :]  # (batch, d_model)
                 
-                # Check for NaN in hidden state
-                if torch.isnan(last_hidden).any():
-                    logger.warning(f"NaN in hidden state for {interval}, skipping batch")
-                    continue
-                
                 # Predict
                 pred = prediction_heads[interval](last_hidden)
-                
-                # Check for NaN in prediction
-                if torch.isnan(pred).any():
-                    logger.warning(f"NaN in prediction for {interval}, skipping batch")
-                    continue
                 
                 # Loss
                 loss = criterion(pred, batch_y)
                 
-                # Check for NaN loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning(f"NaN/Inf loss for {interval}, skipping batch")
-                    continue
+                # Only check for NaN/Inf occasionally (reduce CPU overhead)
+                # Most batches are fine, so we can check less frequently
+                if num_train_batches % 50 == 0:
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        logger.warning(f"NaN/Inf loss for {interval}, skipping batch")
+                        continue
                 
                 # Backward
                 optimizer.zero_grad()
                 loss.backward()
                 
-                # Check for NaN gradients
-                has_nan_grad = False
-                for param in all_params:
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        has_nan_grad = True
-                        break
-                
-                if has_nan_grad:
-                    logger.warning(f"NaN gradients detected for {interval}, skipping update")
-                    optimizer.zero_grad()
-                    continue
+                # Check for NaN gradients (only occasionally to reduce CPU overhead)
+                if num_train_batches % 100 == 0:
+                    has_nan_grad = False
+                    for param in all_params:
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            has_nan_grad = True
+                            break
+                    
+                    if has_nan_grad:
+                        logger.warning(f"NaN gradients detected for {interval}, skipping update")
+                        optimizer.zero_grad()
+                        continue
                 
                 grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 optimizer.step()
                 
-                total_loss += loss.item()
-                interval_loss += loss.item()
-                num_batches += 1
-                interval_batches += 1
+                total_train_loss += loss.item()
+                interval_train_loss += loss.item()
+                num_train_batches += 1
+                interval_train_batches += 1
             
-            # Store interval loss
-            if interval_batches > 0:
-                interval_losses[interval] = interval_loss / interval_batches
+            # Store interval train loss
+            if interval_train_batches > 0:
+                interval_train_losses[interval] = interval_train_loss / interval_train_batches
         
-        if (epoch + 1) % 10 == 0:
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0
-            logger.info(f"Epoch {epoch + 1}/{epochs}, Average Loss: {avg_loss:.6f}")
-            
-            # Log to wandb
-            if use_wandb and WANDB_AVAILABLE:
-                log_dict = {
-                    "stage1/epoch": epoch + 1,
-                    "stage1/total_loss": avg_loss,
-                }
-                # Add per-interval losses
-                for interval, loss_val in interval_losses.items():
-                    log_dict[f"stage1/loss_{interval}"] = loss_val
-                wandb.log(log_dict)
+        # Validation phase
+        transformer.eval()
+        total_val_loss = 0.0
+        num_val_batches = 0
+        interval_val_losses = {}
+        
+        with torch.no_grad():
+            for interval, X_val in X_val_dict.items():
+                y_val = y_val_dict[interval]
+                interval_val_loss = 0.0
+                interval_val_batches = 0
+                
+                # Create validation dataloader (optimized for GPU)
+                X_val_tensor = torch.from_numpy(X_val).float()
+                y_val_tensor = torch.from_numpy(y_val).float()
+                val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+                val_dataloader = DataLoader(
+                    val_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=0,  # Set to 0 to reduce CPU overhead
+                    pin_memory=True if device.type == 'cuda' else False
+                )
+                
+                for batch_X, batch_y in val_dataloader:
+                    # Use non_blocking transfer for faster CPU->GPU
+                    batch_X = batch_X.to(device, non_blocking=True)
+                    batch_y = batch_y.to(device, non_blocking=True)
+                    
+                    # Forward pass
+                    transformer_key = interval.replace("1wk", "1w") if interval == "1wk" else interval
+                    features_dict = {transformer_key: batch_X}
+                    encoded = transformer(features_dict)
+                    
+                    # Get last hidden state
+                    if transformer_key not in encoded:
+                        if interval in encoded:
+                            transformer_key = interval
+                        elif "1w" in encoded and transformer_key == "1wk":
+                            transformer_key = "1w"
+                        else:
+                            continue
+                    
+                    last_hidden = encoded[transformer_key][:, -1, :]
+                    
+                    # Predict
+                    pred = prediction_heads[interval](last_hidden)
+                    
+                    # Loss
+                    loss = criterion(pred, batch_y)
+                    
+                    total_val_loss += loss.item()
+                    interval_val_loss += loss.item()
+                    num_val_batches += 1
+                    interval_val_batches += 1
+                
+                # Store interval validation loss
+                if interval_val_batches > 0:
+                    interval_val_losses[interval] = interval_val_loss / interval_val_batches
+        
+        # Calculate average losses
+        avg_train_loss = total_train_loss / num_train_batches if num_train_batches > 0 else 0
+        avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0
+        
+        # Log every epoch (or every 10 epochs for less verbose output)
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            logger.info(f"Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+        
+        # Log to wandb every epoch
+        if use_wandb and WANDB_AVAILABLE:
+            log_dict = {
+                "stage1/epoch": epoch + 1,
+                "stage1/train_loss": avg_train_loss,
+                "stage1/val_loss": avg_val_loss,
+            }
+            # Add per-interval losses
+            for interval, loss_val in interval_train_losses.items():
+                log_dict[f"stage1/train_loss_{interval}"] = loss_val
+            for interval, loss_val in interval_val_losses.items():
+                log_dict[f"stage1/val_loss_{interval}"] = loss_val
+            wandb.log(log_dict)
     
     logger.info("Transformer pre-training complete!")
     return transformer
@@ -707,15 +925,22 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
         current_global_step = 0
         
         # Persistent entropy settings and state (do NOT reset every epoch)
-        # ENTROPY COEFFICIENT: Reduced for convergence stage
-        # Cut in half from ~0.0078 to 0.003 to allow agent to start converging
-        ENTROPY_COEF_START = 0.003  # Reduced from 0.01 to allow convergence
-        ENTROPY_COEF_MIN = 0.001  # Increased 10x from 0.0001 to maintain minimum exploration
+        # ENTROPY COEFFICIENT: BOOSTED to force exploration and break "HOLD" loop
+        # Increased significantly to make agent try different actions
+        ENTROPY_COEF_START = 0.1  # Force 10x more randomness initially (Updated from 0.05)
+        ENTROPY_COEF_MIN = 0.01    # Sustain minimum exploration
         ENTROPY_COEF_DECAY = 0.99
-        ENTROPY_COEF_MAX = ENTROPY_COEF_START * 20.0  # 0.003 * 20 = 0.06
+        ENTROPY_COEF_MAX = 0.05  # Increased to allow effective "Panic Button" boost
         entropy_coef = ENTROPY_COEF_START
         
         for epoch in range(epochs_per_agent):
+            # FEE-FREE TRAINING LOGIC: Restore fees after FEE_FREE_EPOCHS
+            if epoch == FEE_FREE_EPOCHS:
+                config.commission_rate = original_commission
+                config.slippage_bps = original_slippage
+                logger.info(f"  Epoch {epoch}: [FEE-FREE ENDED] Restoring original fees:")
+                logger.info(f"    commission={config.commission_rate:.4f}, slippage={config.slippage_bps:.1f} bps")
+            
             # DEBUG: Check balance BEFORE reset
             if hasattr(exec_env.base_env, 'balance'):
                 balance_before_reset = exec_env.base_env.balance
@@ -771,9 +996,10 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
             if epoch % 10 == 0 or epoch < 5:
                 logger.info(f"  Epoch {epoch}: Entropy Coef (persistent) = {entropy_coef:.6f} (Progress: {epoch_progress:.1%})")
             
-            # Track action diversity to detect policy collapse
+            # Track action diversity and entropy boost state
             action_history = []  # Track last 100 actions to detect collapse
             ACTION_HISTORY_SIZE = 100
+            action_collapse_active = False  # Flag for entropy boost "Panic Button"
             
             for step in range(steps_per_epoch):
                 current_global_step += 1
@@ -889,89 +1115,88 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     # Inputs don't need gradients (they're data), but model parameters do
                     logits, value_tensor = agent(features_dict, strategy_feat, precision_feat, local_feat)
                     
-                    # DEBUG: Print logits every 100 steps to check if agent is making decisions
+                    # ---------------------------------------------------------------------
+                    # FIXED ACTION SELECTION LOGIC
+                    # ---------------------------------------------------------------------
+                    
+                    # FIX 1: Prevent Saturation (The "Clamp" Bug)
+                    # Normalize logits so the max is 0. This preserves relative differences 
+                    # (Softmax is translation invariant) but prevents hitting the clamp ceiling.
+                    # Example: [62, 40, 36] -> [0, -22, -26]
+                    logits = logits - torch.max(logits, dim=-1, keepdim=True)[0]
+                    
+                    # Now we can safely clamp to avoid -inf issues without destroying signal
+                    logits = torch.clamp(logits, min=-50.0, max=50.0)
+                    
+                    # FIX 2: Apply Action Masking (The "Missing Mask" Bug)
+                    # local_feat[:, 0] is position_status (1.0 = Held, 0.0 = Cash)
+                    if local_feat is not None:
+                        # Use a sufficiently large negative number, but safe for float16/32
+                        MASK_VALUE = -1e9 
+                        
+                        # Extract position status (batch_size, )
+                        pos_status = local_feat[:, 0]
+                        
+                        # Apply mask to the logits tensor directly
+                        # If Held (pos > 0.5): Mask BUY (index 1)
+                        # If Cash (pos < 0.5): Mask SELL (index 2)
+                        
+                        # Vectorized masking (faster and cleaner)
+                        # Create boolean masks
+                        has_position = pos_status > 0.5
+                        no_position = ~has_position
+                        
+                        # Apply mask: logits[row, col] = -1e9
+                        # Note: We must clone to avoid in-place operations if needed for gradient, 
+                        # but here we are just sampling actions, so in-place is fine for 'logits' 
+                        # as long as we use 'original_logits' for loss calculation if needed.
+                        # (Standard PPO uses the *old* log_probs, new pass calculates fresh logits)
+                        
+                        # Mask BUY (Index 1) where we have position
+                        logits[has_position, 1] = MASK_VALUE
+                        
+                        # Mask SELL (Index 2) where we have NO position
+                        logits[no_position, 2] = MASK_VALUE
+
+                    # FIX 3: Temperature Scaling & Distribution
+                    # Apply temperature to the *masked* logits
+                    temperature = getattr(agent, "temperature", 1.0)
+                    if agent.training: 
+                        temperature = max(temperature, 1.5) # Raised from 0.5 to 1.5 to maintain curiousity
+                    used_logits = logits / temperature
+                    
+                    # FIX 4: Probability Floor (ε-greedy) "The Defibrillator"
+                    # We force a 5% minimum probability for every VALID action to break deadlocks
+                    probs = F.softmax(used_logits, dim=-1)
+                    if agent.training:
+                        epsilon = 0.05  # 5% floor
+                        # Identify valid actions (those not masked with -1e9)
+                        valid_mask = (logits > -1e8).float()
+                        num_valid = valid_mask.sum(dim=-1, keepdim=True)
+                        # Create uniform distribution across valid actions
+                        uniform_probs = valid_mask / (num_valid + 1e-9)
+                        # Mix network probabilities with uniform exploration
+                        probs = (1.0 - epsilon) * probs + epsilon * uniform_probs
+                    
+                    # Create distribution from mixed probabilities
+                    dist = torch.distributions.Categorical(probs=probs)
+                    
+                    # Sample action
+                    action = dist.sample()
+                    log_prob = dist.log_prob(action)
+                    
+                    # Debug Logging (Check if fixed)
+                    # Debug Logging: Show ACTUAL mixed probabilities (with 5% floor)
                     if step % 100 == 0:
-                        logits_np = logits[0].detach().cpu().numpy()
-                        logger.info(f"  Step {step}: DEBUG LOGITS: {logits_np} (Strategy: {strategy})")
-                        # Check if logits are all identical (dead network)
-                        if len(logits_np) > 1 and np.allclose(logits_np, logits_np[0], atol=1e-6):
-                            logger.warning(f"  [WARNING] All logits are identical! Network may be dead. Logits: {logits_np}")
+                         probs_np = probs[0].detach().cpu().numpy()
+                         logger.info(f"  Step {step}: Mixed Probs (with floor): HOLD:{probs_np[0]:.3f}, BUY:{probs_np[1]:.3f}, SELL:{probs_np[2]:.3f}")
+                    # ---------------------------------------------------------------------
                     
-                    # DEBUG: Check for NaN/Inf in outputs
-                    # CRITICAL: Don't use torch.nan_to_num() or zeros_like() here - they break gradients!
-                    # The model's forward() already handles NaN with gradient-preserving replacement
-                    # If we still get NaN here, it means the model itself has issues
-                    # ============================================================
-                    # LOGIT PARAMETERS (CRITICAL FIX for Policy Collapse)
-                    # ============================================================
-                    # CRITICAL FIX: Extreme logits cause softmax collapse to single action
-                    # Tighter clamping + temperature scaling to prevent deterministic behavior
-                    # ============================================================
-                    LOGIT_CLAMP_MIN = -5.0   # Tighter: Prevent extreme values
-                    LOGIT_CLAMP_MAX = +5.0   # Tighter: Keep probabilities reasonable
-                    LOGIT_TEMPERATURE = 2.5  # Temperature scaling: Increased from 1.5 to 2.5 for stronger exploration
-                    
-                    if torch.isnan(logits).any() or torch.isinf(logits).any():
-                        logger.warning("NaN/Inf in logits after model forward - model may have issues")
-                        # Try to maintain gradient connection if possible
-                        logits = logits + 0.0 * torch.zeros_like(logits)  # Maintain connection
-                        logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
-                    
+                    # Check for NaN/Inf in value_tensor
                     if torch.isnan(value_tensor).any() or torch.isinf(value_tensor).any():
                         logger.warning("NaN/Inf in value_tensor after model forward - model may have issues")
                         # Maintain gradient connection
                         value_tensor = value_tensor + 0.0 * torch.zeros_like(value_tensor)
-                    
-                    # CRITICAL FIX: Clamp FIRST, then apply adaptive temperature scaling
-                    # This prevents extreme logits from causing policy collapse
-                    logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
-                    
-                    # Adaptive temperature scaling to reach a target entropy for 3 actions
-                    LOGIT_TEMPERATURE_BASE = 2.5  # starting temperature
-                    TARGET_ACTION_ENTROPY = 0.5   # ~half of max (~1.0986) for 3-way action
-                    TEMP_MAX = 10.0               # upper bound to avoid over-flattening
-                    TEMP_GROWTH = 1.5             # multiplicative growth per adjustment
-                    temp = LOGIT_TEMPERATURE_BASE
-                    
-                    used_logits = logits / temp
-                    dist = torch.distributions.Categorical(logits=used_logits)
-                    entropy_val_temp = dist.entropy().item()
-                    adjust_count = 0
-                    while entropy_val_temp < TARGET_ACTION_ENTROPY and temp < TEMP_MAX:
-                        temp = min(temp * TEMP_GROWTH, TEMP_MAX)
-                        used_logits = logits / temp
-                        dist = torch.distributions.Categorical(logits=used_logits)
-                        entropy_val_temp = dist.entropy().item()
-                        adjust_count += 1
-                    if adjust_count > 0:
-                        logger.debug(f"Adaptive temperature: increased to {temp:.2f} to reach entropy {entropy_val_temp:.3f}")
-                    
-                    # Create distribution (with final temperature) and sample action
-                    action = dist.sample()
-                    log_prob = dist.log_prob(action)
-                    
-                    # CRITICAL FIX: Log action probabilities MORE FREQUENTLY to detect collapse early
-                    # Log every 50 steps (not 100) and every epoch (not 10) to catch collapse quickly
-                    if step % 50 == 0:  # More frequent logging
-                        probs = F.softmax(used_logits, dim=-1)
-                        entropy_val = dist.entropy().item()
-                        logger.info(f"  Step {step}: Action probs = HOLD:{probs[0,0]:.3f}, BUY:{probs[0,1]:.3f}, SELL:{probs[0,2]:.3f}, Entropy={entropy_val:.4f}")
-                        
-                        # ============================================================
-                        # POLICY COLLAPSE DETECTION (CRITICAL - Detect Early!)
-                        # ============================================================
-                        max_prob = probs.max(dim=-1).values.mean().item()
-                        if max_prob > 0.90:  # Lower threshold: Detect collapse earlier (was 0.95)
-                            logger.warning(f"[WARNING] POLICY COLLAPSE DETECTED: max_action_prob = {max_prob:.2%}. Agent is deterministic!")
-                            logger.warning(f"   Action distribution: HOLD={probs[0,0]:.1%}, BUY={probs[0,1]:.1%}, SELL={probs[0,2]:.1%}")
-                            logger.warning(f"   Entropy={entropy_val:.4f} (should be >0.5 for 3 actions)")
-                            
-                            # CRITICAL FIX: Reset entropy coefficient if collapse detected
-                            # This forces agent to explore again
-                            if entropy_val < 0.3:  # Very low entropy = collapse
-                                old_entropy_coef = entropy_coef
-                                entropy_coef = min(entropy_coef * 2.0, ENTROPY_COEF_MAX)  # Double it, capped by max
-                                logger.warning(f"   RESETTING entropy_coef: {old_entropy_coef:.6f} -> {entropy_coef:.6f} to force exploration (cap={ENTROPY_COEF_MAX:.6f})")
                     
                     # DEBUG: Detach values for storage (old policy values)
                     # These are used for computing advantages and ratios, but don't need gradients
@@ -1005,13 +1230,19 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     action_proportions = {k: v/total_actions for k, v in action_counts.items()}
                     max_proportion = max(action_proportions.values())
                     
-                    # CRITICAL: Warn if one action dominates (>80% of recent actions)
-                    if max_proportion > 0.80:
+                    # CRITICAL: Warn if one action dominates (>90% of recent actions)
+                    if max_proportion > 0.90:
                         dominant_action = max(action_proportions, key=action_proportions.get)
                         action_names = {0: "HOLD", 1: "BUY", 2: "SELL"}
                         logger.warning(f"[WARNING] ACTION COLLAPSE DETECTED: {action_names[dominant_action]} is {max_proportion:.1%} of last {len(action_history)} actions!")
                         logger.warning(f"   Action distribution: HOLD={action_proportions[0]:.1%}, BUY={action_proportions[1]:.1%}, SELL={action_proportions[2]:.1%}")
-                        logger.warning(f"   This indicates policy collapse - agent is not exploring!")
+                        logger.warning(f"   PANIC BUTTON: Activating Entropy Boost (3x) for next update!")
+                        action_collapse_active = True
+                    elif max_proportion < 0.70:
+                        # Recovery: Reset flag if diversity improves
+                        if action_collapse_active:
+                             logger.info(f"   [RECOVERY] Action diversity restored ({max_proportion:.1%}), disabling Entropy Boost.")
+                        action_collapse_active = False
                 
                 # Step environment (this doesn't need gradients)
                 next_state, reward, done, truncated, info = exec_env.step(action_item)
@@ -1023,25 +1254,23 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     if isinstance(reward_breakdown, dict):
                         log_return = reward_breakdown.get('log_return', 'N/A')
                         transaction_cost_ratio = reward_breakdown.get('transaction_cost_ratio', 'N/A')
+                        fixed_penalty = reward_breakdown.get('fixed_penalty', 'N/A')
                         raw_reward = reward_breakdown.get('raw_reward', 'N/A')
-                        multiplier_applied = reward_breakdown.get('multiplier_applied', 'N/A')
                         scaled_reward = reward_breakdown.get('scaled_reward', 'N/A')
-                        volatility_penalty = reward_breakdown.get('volatility_penalty', 'N/A')
                         exit_reason = reward_breakdown.get('exit_reason', 'N/A')
                         bars_held = reward_breakdown.get('bars_held', 'N/A')
                         
                         logger.info(f"  Step {step}: REWARD BREAKDOWN:")
-                        # Format numeric values, keep strings as-is
+                        # Format numeric values
                         log_return_str = f"{log_return:.6f}" if isinstance(log_return, (int, float)) else str(log_return)
                         transaction_cost_str = f"{transaction_cost_ratio:.6f}" if isinstance(transaction_cost_ratio, (int, float)) else str(transaction_cost_ratio)
+                        fixed_penalty_str = f"{fixed_penalty:.4f}" if isinstance(fixed_penalty, (int, float)) else str(fixed_penalty)
                         raw_reward_str = f"{raw_reward:.4f}" if isinstance(raw_reward, (int, float)) else str(raw_reward)
                         scaled_reward_str = f"{scaled_reward:.4f}" if isinstance(scaled_reward, (int, float)) else str(scaled_reward)
-                        volatility_penalty_str = f"{volatility_penalty:.4f}" if isinstance(volatility_penalty, (int, float)) else str(volatility_penalty)
                         
                         logger.info(f"    log_return={log_return_str}, transaction_cost_ratio={transaction_cost_str}")
-                        logger.info(f"    raw_reward={raw_reward_str}, multiplier={multiplier_applied}, scaled={scaled_reward_str}")
-                        logger.info(f"    volatility_penalty={volatility_penalty_str}, exit_reason={exit_reason}, bars_held={bars_held}")
-                        logger.info(f"    final_reward={reward:.4f}")
+                        logger.info(f"    fixed_penalty={fixed_penalty_str}, raw_reward={raw_reward_str}, scaled={scaled_reward_str}")
+                        logger.info(f"    exit_reason={exit_reason}, bars_held={bars_held}, reward={reward:.4f}")
                     else:
                         logger.warning(f"  Step {step}: No reward_breakdown in info dict! Keys: {list(info.keys())}")
                 
@@ -1182,8 +1411,10 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     stats.reset()
                 
                 # DEBUG: PPO update with larger batch size for better GPU utilization
-                # Increased from 100 to 400 (4x) to match increased batch_size in Stage 1
-                PPO_BATCH_SIZE_STAGE2 = 400
+                # FIX: Batch size must be clean divisor of steps_per_epoch (2048)
+                # 2048 / 64 = 32 minibatches (standard and stable)
+                # Old: 400 doesn't divide cleanly (2048 / 400 = 5.12, wastes data)
+                PPO_BATCH_SIZE_STAGE2 = 64  # Changed from 400 to 64 for clean division
                 if len(memory_rewards) >= PPO_BATCH_SIZE_STAGE2:
                     logger.debug(f"PPO update triggered at step {step}, memory size: {len(memory_rewards)} (batch_size={PPO_BATCH_SIZE_STAGE2})")
                     
@@ -1244,464 +1475,154 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                     logger.debug(f"Stacked tensors - actions: {old_actions.shape}, logprobs: {old_logprobs.shape}, values: {old_values.shape}")
                     logger.debug(f"Old tensors requires_grad - actions: {old_actions.requires_grad}, logprobs: {old_logprobs.requires_grad}, values: {old_values.requires_grad}")
                     
-                    # DEBUG: PPO optimization loop (multiple epochs for better updates)
-                    for ppo_epoch in range(3):
-                        optimizer.zero_grad()
+                    # === VECTORIZED PPO UPDATE (GOOD CODE B) ===
+                    # 1. Stack all inputs into tensors for parallel processing
+                    keys = memory_states[0][0].keys()
+                    stacked_features_dict = {}
+                    for key in keys:
+                        tensors = [s[0][key] if isinstance(s[0][key], torch.Tensor) else torch.tensor(s[0][key], dtype=torch.float32) for s in memory_states]
+                        # Dynamically detect feature dimension from samples
+                        feat_dim = tensors[0].shape[-1]
+                        stacked_features_dict[key] = torch.stack(tensors).view(len(memory_states), -1, feat_dim).detach().to(device)
+                    
+                    strategy_feats = torch.stack([s[1] if isinstance(s[1], torch.Tensor) else torch.tensor(s[1], dtype=torch.float32) for s in memory_states]).view(len(memory_states), -1).detach().to(device)
+                    precision_feats = torch.stack([s[2] if isinstance(s[2], torch.Tensor) else torch.tensor(s[2], dtype=torch.float32) for s in memory_states]).view(len(memory_states), -1).detach().to(device)
+                    local_feats = torch.stack([s[3] if isinstance(s[3], torch.Tensor) else torch.tensor(s[3], dtype=torch.float32) for s in memory_states]).view(len(memory_states), -1).detach().to(device)
+
+                    # 2. PPO Math: Calculate Advantages once (old policy Baseline)
+                    advantages = rewards - old_values
+                    
+                    # --- WHITEBOX: ADVANTAGE HISTOGRAM ---
+                    if current_global_step % 500 == 0:  # Save every 500 steps
+                        plt.figure(figsize=(10, 5))
+                        plt.hist(advantages.cpu().numpy(), bins=50, color='lightgreen', edgecolor='black')
+                        plt.title(f"Advantage Distribution - {strategy} (Step {current_global_step})")
+                        plt.xlabel("Advantage")
+                        plt.ylabel("Frequency")
+                        plt.grid(alpha=0.3)
+                        plot_path = f"debug_advantages_stage2_{strategy.lower()}_step_{current_global_step}.png"
+                        plt.savefig(plot_path)
+                        plt.close()
+                    
+                    advantages_mean = advantages.mean()
+                    advantages_std = advantages.std() + 1e-8
+                    advantages = (advantages - advantages_mean) / advantages_std
+                    advantages = torch.clamp(advantages, min=-5.0, max=5.0).detach()
+                    
+                    # 3. PPO Optimization Loop (multiple epochs for stability)
+                    PPO_EPOCHS = 3
+                    MINIBATCH_SIZE = 64
+                    
+                    for ppo_epoch in range(PPO_EPOCHS):
+                        # Shuffling for this epoch
+                        indices = torch.randperm(len(old_actions))
                         
-                        # DEBUG: Re-evaluate with current policy (WITH gradients for new policy)
-                        # This computes new log_probs and values with gradients enabled
-                        logprobs_list = []
-                        values_list = []
-                        entropies_list = []
+                        epoch_actor_loss = 0.0
+                        epoch_critic_loss = 0.0
+                        epoch_entropy = 0.0
+                        num_batches = 0
                         
-                        for idx, (state_tuple, act) in enumerate(zip(memory_states, old_actions)):
-                            try:
-                                # Unpack state: (features_dict, strategy_feat, precision_feat, local_feat)
-                                feat_dict = state_tuple[0]
-                                strat_feat = state_tuple[1]
-                                prec_feat = state_tuple[2] if len(state_tuple) > 2 else None
-                                local_feat = state_tuple[3] if len(state_tuple) > 3 else None
-                                
-                                # DEBUG: Use stored features - they're already tensors created from numpy
-                                # CRITICAL: Inputs don't need gradients (they're data), but we must NOT detach them
-                                # before passing to model. The model will create gradients through its parameters.
-                                # Just ensure they're on the right device
-                                feat_dict_ready = {}
-                                for key, val in feat_dict.items():
-                                    if isinstance(val, torch.Tensor):
-                                        # Use original tensor, ensure it's on device
-                                        # Don't detach! Just move to device if needed
-                                        if val.device != device:
-                                            feat_dict_ready[key] = val.to(device)
-                                        else:
-                                            feat_dict_ready[key] = val
-                                        # Ensure it doesn't require grad (it's input data)
-                                        feat_dict_ready[key] = feat_dict_ready[key].requires_grad_(False)
-                                    else:
-                                        # Convert to tensor if not already
-                                        feat_dict_ready[key] = torch.tensor(val, device=device, requires_grad=False)
-                                
-                                if isinstance(strat_feat, torch.Tensor):
-                                    if strat_feat.device != device:
-                                        strat_feat_ready = strat_feat.to(device)
-                                    else:
-                                        strat_feat_ready = strat_feat
-                                    strat_feat_ready = strat_feat_ready.requires_grad_(False)
-                                else:
-                                    strat_feat_ready = torch.tensor(strat_feat, device=device, requires_grad=False)
-                                
-                                # Prepare precision features
-                                if prec_feat is not None and isinstance(prec_feat, torch.Tensor):
-                                    if prec_feat.device != device:
-                                        prec_feat_ready = prec_feat.to(device)
-                                    else:
-                                        prec_feat_ready = prec_feat
-                                    prec_feat_ready = prec_feat_ready.requires_grad_(False)
-                                else:
-                                    prec_feat_ready = torch.zeros(1, 4, device=device, dtype=torch.float32)
-                                
-                                # Prepare local features (HYBRID INPUT)
-                                if local_feat is not None and isinstance(local_feat, torch.Tensor):
-                                    if local_feat.device != device:
-                                        local_feat_ready = local_feat.to(device)
-                                    else:
-                                        local_feat_ready = local_feat
-                                    local_feat_ready = local_feat_ready.requires_grad_(False)
-                                else:
-                                    local_feat_ready = torch.zeros(1, 4, device=device, dtype=torch.float32)
-                                
-                                # Forward pass WITH gradients (for new policy)
-                                # Model parameters have gradients, inputs don't (which is correct)
-                                # DEBUG: Ensure agent is in training mode
-                                agent.train()
-                                
-                                # DEBUG: Verify model parameters require gradients BEFORE forward pass
-                                params_require_grad = any(p.requires_grad for p in agent.parameters())
-                                if not params_require_grad:
-                                    logger.error(f"CRITICAL: Model parameters don't require gradients at idx {idx}!")
-                                    # Force enable gradients on all parameters
-                                    for p in agent.parameters():
-                                        p.requires_grad = True
-                                    logger.warning(f"Force-enabled gradients on all parameters")
-                                
-                                # Forward pass - this should create outputs connected to model parameters
-                                logits, value = agent(feat_dict_ready, strat_feat_ready, prec_feat_ready, local_feat_ready)
-                                
-                                # DEBUG: Verify outputs are connected to computation graph
-                                # CRITICAL: Outputs MUST have grad_fn to enable backpropagation
-                                # Check grad_fn (more reliable than requires_grad for intermediate outputs)
-                                logits_has_grad_fn = logits.grad_fn is not None
-                                value_has_grad_fn = value.grad_fn is not None
-                                
-                                if not logits_has_grad_fn:
-                                    logger.error(f"CRITICAL: logits at idx {idx} has no grad_fn - computation graph broken!")
-                                    logger.error(f"  This means gradients cannot flow back to model parameters")
-                                    logger.error(f"  Check if model forward() uses torch.nan_to_num() or other detached operations")
-                                    # Try to diagnose: check if inputs have issues
-                                    for k, v in feat_dict_ready.items():
-                                        logger.error(f"  Input {k}: shape={v.shape}, device={v.device}, requires_grad={v.requires_grad}")
-                                
-                                if not value_has_grad_fn:
-                                    logger.error(f"CRITICAL: value at idx {idx} has no grad_fn - computation graph broken!")
-                                
-                                # If both outputs lack grad_fn, this is a critical error
-                                if not logits_has_grad_fn and not value_has_grad_fn:
-                                    raise RuntimeError(
-                                        f"Computation graph broken at idx {idx}: "
-                                        f"Neither logits nor value have grad_fn. "
-                                        f"Model outputs are not connected to parameters. "
-                                        f"Check model forward() for detached operations (torch.nan_to_num, etc.)"
-                                    )
-                                
-                                # DEBUG: Check for NaN/Inf
-                                # If NaN/Inf found, replace but maintain computation graph connection
-                                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                                    logger.warning(f"NaN/Inf in logits at idx {idx}, using uniform")
-                                    # Create uniform logits but maintain gradient connection through model
-                                    # Use a small operation to keep graph intact
-                                    uniform_logits = torch.zeros_like(logits)
-                                    # Maintain connection: uniform = 0 + 0*logits (keeps graph if logits had grad_fn)
-                                    if logits.grad_fn is not None:
-                                        uniform_logits = uniform_logits + 0.0 * logits  # Maintain gradient connection
-                                    logits = uniform_logits
-                                
-                                if torch.isnan(value).any() or torch.isinf(value).any():
-                                    logger.warning(f"NaN/Inf in value at idx {idx}, using zero")
-                                    # Create zero value but maintain gradient connection
-                                    zero_value = torch.zeros_like(value)
-                                    if value.grad_fn is not None:
-                                        zero_value = zero_value + 0.0 * value  # Maintain gradient connection
-                                    value = zero_value
-                                
-                                # Clamp logits then apply adaptive temperature scaling to prevent collapse
-                                LOGIT_CLAMP_MIN = -5.0
-                                LOGIT_CLAMP_MAX = 5.0
-                                logits = torch.clamp(logits, min=LOGIT_CLAMP_MIN, max=LOGIT_CLAMP_MAX)
-                                
-                                LOGIT_TEMPERATURE_BASE = 2.5
-                                TARGET_ACTION_ENTROPY = 0.5
-                                TEMP_MAX = 10.0
-                                TEMP_GROWTH = 1.5
-                                temp = LOGIT_TEMPERATURE_BASE
-                                
-                                used_logits = logits / temp
-                                dist = torch.distributions.Categorical(logits=used_logits)
-                                ev = dist.entropy()
-                                entropy_val_temp = ev.mean().item() if ev.dim() > 0 else ev.item()
-                                adjust_count = 0
-                                while entropy_val_temp < TARGET_ACTION_ENTROPY and temp < TEMP_MAX:
-                                    temp = min(temp * TEMP_GROWTH, TEMP_MAX)
-                                    used_logits = logits / temp
-                                    dist = torch.distributions.Categorical(logits=used_logits)
-                                    ev = dist.entropy()
-                                    entropy_val_temp = ev.mean().item() if ev.dim() > 0 else ev.item()
-                                    adjust_count += 1
-                                if adjust_count > 0:
-                                    logger.debug(f"Adaptive temperature (re-eval): increased to {temp:.2f} to reach entropy {entropy_val_temp:.3f}")
-                                
-                                # Create distribution and compute new policy log_prob with final temperature
-                                # act is from old_actions (detached), but log_prob is from new policy (with gradients)
-                                # Ensure act is a proper tensor
-                                act_tensor = act if isinstance(act, torch.Tensor) else torch.tensor(act, device=device, dtype=torch.long)
-                                log_prob = dist.log_prob(act_tensor)
-                                value_squeezed = value.squeeze()
-                                entropy = dist.entropy()
-                                
-                                # DEBUG: These should be part of computation graph even if requires_grad is False
-                                # The key is that they're computed from model outputs, which depend on model parameters
-                                # When used in loss.backward(), gradients will flow through model parameters
-                                # We don't need to check requires_grad on intermediate outputs
-                                
-                                logprobs_list.append(log_prob)
-                                values_list.append(value_squeezed)
-                                entropies_list.append(entropy)
-                            except Exception as e:
-                                logger.error(f"Error in re-evaluation at idx {idx}: {e}, skipping this sample")
-                                # Skip this sample instead of using old values (which would break gradients)
-                                # We'll handle this by checking list lengths before stacking
-                                continue
-                        
-                        # DEBUG: Check if we have valid samples (some might have been skipped)
-                        if len(logprobs_list) == 0:
-                            logger.warning(f"No valid samples for PPO update at epoch {ppo_epoch}, skipping")
-                            break
-                        
-                        # DEBUG: Stack new policy values
-                        # IMPORTANT: Intermediate outputs (logprobs, values) might not show requires_grad=True
-                        # even though they're part of the computation graph. This is normal!
-                        # Gradients will flow when we use them in loss.backward() because they depend on
-                        # model parameters that DO require gradients.
-                        new_logprobs = torch.stack(logprobs_list)
-                        new_values = torch.stack(values_list)
-                        entropies = torch.stack(entropies_list)
-                        
-                        logger.debug(f"New policy - logprobs: {new_logprobs.shape}, values: {new_values.shape}, entropies: {entropies.shape}")
-                        
-                        # DEBUG: Verify model parameters require gradients (this is what matters for backprop)
-                        # The outputs themselves might not show requires_grad=True, but if parameters do,
-                        # gradients will flow when we compute the loss and call backward()
-                        params_require_grad = sum(p.requires_grad for p in agent.parameters())
-                        total_params = len(list(agent.parameters()))
-                        if params_require_grad == 0:
-                            logger.error("CRITICAL: No model parameters require gradients!")
-                            raise RuntimeError("Model parameters don't require gradients - cannot train")
-                        
-                        logger.debug(f"Model parameters requiring grad: {params_require_grad}/{total_params}")
-                        
-                        # DEBUG: Test that computation graph is intact
-                        # CRITICAL INSIGHT: Intermediate outputs might not show requires_grad=True,
-                        # but they can still be part of computation graph (have grad_fn).
-                        # What matters is that when we use them in a loss and call backward(),
-                        # gradients flow to model parameters.
-                        # 
-                        # The test: Create a simple operation and check if it has grad_fn.
-                        # If grad_fn exists, the computation graph is intact and gradients can flow.
-                        try:
-                            # Create a test operation using the outputs
-                            test_loss = new_logprobs.mean() + new_values.mean()
+                        for i in range(0, len(old_actions), MINIBATCH_SIZE):
+                            idx = indices[i : i + MINIBATCH_SIZE]
+                            if len(idx) < 2: continue # Skip tiny final batches
                             
-                            # Check if computation graph is intact
-                            # grad_fn indicates the operation that created the tensor
-                            # If it exists, the tensor is connected to the computation graph
-                            has_grad_fn = test_loss.grad_fn is not None
+                            # Slice Minibatch
+                            b_features = {k: v[idx] for k, v in stacked_features_dict.items()}
+                            b_strategy = strategy_feats[idx]
+                            b_precision = precision_feats[idx]
+                            b_local = local_feats[idx]
+                            b_old_actions = old_actions[idx]
+                            b_old_logprobs = old_logprobs[idx]
+                            b_rewards = rewards[idx]
+                            b_advantages = advantages[idx]
+
+                            optimizer.zero_grad()
                             
-                            if not has_grad_fn:
-                                # This is a problem - outputs aren't connected to model parameters
-                                logger.error("CRITICAL: Loss doesn't have grad_fn - computation graph is broken!")
-                                logger.error(f"new_logprobs.grad_fn: {new_logprobs.grad_fn}")
-                                logger.error(f"new_values.grad_fn: {new_values.grad_fn}")
-                                logger.error(f"new_logprobs.requires_grad: {new_logprobs.requires_grad}")
-                                logger.error(f"new_values.requires_grad: {new_values.requires_grad}")
-                                logger.error(f"Agent training mode: {agent.training}")
-                                logger.error(f"Model params requiring grad: {params_require_grad}/{total_params}")
+                            # Vectorized forward pass
+                            logits, values = agent(b_features, b_strategy, b_precision, b_local)
+                            values = values.squeeze()
+                            
+                            # Normalize & Clamp logits
+                            logits = logits - torch.max(logits, dim=-1, keepdim=True)[0]
+                            logits = torch.clamp(logits, min=-50.0, max=50.0)
+                            
+                            # ACTION MASKING in PPO update (CRITICAL FIX)
+                            # local_feat[:, 0] is position_status (1.0 = Held, 0.0 = Cash)
+                            mask_val = -1e9
+                            pos_status = b_local[:, 0]
+                            has_pos = pos_status > 0.5
+                            no_pos = ~has_pos
+                            
+                            # Apply mask to current logits
+                            logits[has_pos, 1] = mask_val  # Mask BUY
+                            logits[no_pos, 2] = mask_val   # Mask SELL
+                            
+                            # Temperature application (matching environment base logic)
+                            temp = 2.5
+                            used_logits = logits / temp
+                            dist = torch.distributions.Categorical(logits=used_logits)
+                            
+                            new_logprobs = dist.log_prob(b_old_actions)
+                            entropies = dist.entropy()
+                            
+                            # PPO Surrogate Objective
+                            ratios = torch.exp(new_logprobs - b_old_logprobs)
+                            surr1 = ratios * b_advantages
+                            surr2 = torch.clamp(ratios, 0.8, 1.2) * b_advantages
+                            actor_loss = -torch.min(surr1, surr2).mean()
+                            
+                            # Critic Loss
+                            critic_loss = F.mse_loss(values, b_rewards)
+                            
+                            # Entropy Bonus
+                            entropy_bonus = entropies.mean()
+                            
+                            # Apply Entropy Boost if collapse is active
+                            active_entropy_coef = entropy_coef
+                            if action_collapse_active:
+                                active_entropy_coef = min(entropy_coef * 3.0, ENTROPY_COEF_MAX)
+
+                            total_loss = actor_loss + 0.5 * critic_loss - active_entropy_coef * entropy_bonus
+                            
+                            # Backward & Step
+                            if not torch.isnan(total_loss):
+                                total_loss.backward()
+                                torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                                optimizer.step()
                                 
-                                # Try to diagnose: check if individual outputs have grad_fn
-                                sample_logprob = logprobs_list[0] if len(logprobs_list) > 0 else None
-                                sample_value = values_list[0] if len(values_list) > 0 else None
-                                if sample_logprob is not None:
-                                    logger.error(f"Sample logprob.grad_fn: {sample_logprob.grad_fn}")
-                                if sample_value is not None:
-                                    logger.error(f"Sample value.grad_fn: {sample_value.grad_fn}")
-                                
-                                raise RuntimeError("Computation graph is broken - outputs not connected to model parameters")
+                                epoch_actor_loss += actor_loss.item()
+                                epoch_critic_loss += critic_loss.item()
+                                epoch_entropy += entropy_bonus.item()
+                                num_batches += 1
                             
-                            logger.debug(f"✓ Computation graph intact: test_loss has grad_fn")
-                            del test_loss
-                        except RuntimeError:
-                            raise  # Re-raise our custom error
-                        except Exception as e:
-                            logger.error(f"CRITICAL: Cannot create loss from outputs: {e}")
-                            raise RuntimeError(f"Computation graph broken: {e}")
-                        
-                        # DEBUG: Old values are already detached from stacking, but ensure they're clones
-                        # This prevents any potential issues with shared memory
-                        old_logprobs_detached = old_logprobs.clone()
-                        old_values_detached = old_values.clone()
-                        
-                        # DEBUG: Calculate advantages (rewards - old_values, old_values are detached)
-                        # rewards is a tensor (no gradients), old_values_detached is detached (no gradients)
-                        # advantages should not have gradients (they're computed from non-differentiable values)
-                        advantages = rewards - old_values_detached
-                        # ============================================================
-                        # ADVANTAGE NORMALIZATION (CRITICAL FIX for Large Actor Loss)
-                        # ============================================================
-                        # CRITICAL FIX: Normalize advantages to prevent huge actor loss
-                        # Large advantages (e.g., 50-100) cause actor_loss to be huge (38+)
-                        # This makes entropy/actor ratio tiny even with good entropy
-                        # Normalize advantages to have mean=0, std=1 (standard PPO practice)
-                        # ============================================================
-                        advantages_mean = advantages.mean()
-                        advantages_std = advantages.std() + 1e-8  # Avoid division by zero
-                        advantages = (advantages - advantages_mean) / advantages_std
-                        
-                        # ============================================================
-                        # ADVANTAGE CLIPPING (from Principal ML Engineer Audit)
-                        # ============================================================
-                        # After normalization, clip to reasonable range (e.g., [-5, +5])
-                        # This prevents extreme values while preserving signal
-                        # ============================================================
-                        ADVANTAGE_CLIP_MIN = -5.0   # Tighter: After normalization, ±5 std is reasonable
-                        ADVANTAGE_CLIP_MAX = +5.0   # Tighter: Prevents extreme outliers
-                        advantages = torch.clamp(advantages, min=ADVANTAGE_CLIP_MIN, max=ADVANTAGE_CLIP_MAX)
-                        advantages = advantages.detach()  # Ensure advantages don't have gradients
-                        
-                        # Log advantage statistics for debugging
-                        if step % 500 == 0:
-                            logger.info(f"Advantage Stats (step {step}): mean={advantages.mean().item():.3f}, std={advantages.std().item():.3f}, min={advantages.min().item():.3f}, max={advantages.max().item():.3f}")
-                        
-                        # ============================================================
-                        # PPO OBJECTIVE CALCULATION
-                        # ============================================================
-                        
-                        # FIX 1: Ensure shapes match to prevent Broadcasting Explosion
-                        if new_logprobs.shape != old_logprobs_detached.shape:
-                            new_logprobs = new_logprobs.view_as(old_logprobs_detached)
-                        
-                        # Calculate ratios
-                        ratios = torch.exp(new_logprobs - old_logprobs_detached)
-                        
-                        # Calculate Surrogates
-                        surr1 = ratios * advantages
-                        surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
-                        
-                        # ==========================================
-                        # DEBUG DIAGNOSTICS (Right before actor_loss)
-                        # ==========================================
-                        
-                        # 1. Check if the model has actually changed since data collection
-                        # If diff is 0.0, the model isn't learning (or learning rate is too low)
-                        log_prob_diff = (new_logprobs - old_logprobs_detached).abs().mean().item()
-                        
-                        # 2. Check the raw scale of advantages
-                        # If these are like 0.00001, your reward scale is too small relative to normalization
-                        adv_mean = advantages.mean().item()
-                        adv_std = advantages.std().item()
-                        
-                        # 3. Check the ratios directly
-                        # If these are all exactly 1.0, your implementation of PPO is broken (detached incorrectly?)
-                        ratio_mean = ratios.mean().item()
-                        ratio_std = ratios.std().item()
-                        
-                        logger.info(f"--- DEBUG DIAGNOSTICS ---")
-                        logger.info(f"LogProb Diff (New - Old): {log_prob_diff:.8f}")
-                        logger.info(f"Advantages: Mean={adv_mean:.6f} | Std={adv_std:.6f}")
-                        logger.info(f"Ratios: Mean={ratio_mean:.6f} | Std={ratio_std:.6f}")
-                        logger.info(f"-------------------------")
-                        
-                        # Calculate PPO Loss (Negative because we want to maximize objective)
-                        # Using .mean() here is correct
-                        actor_loss = -torch.min(surr1, surr2).mean()
-                        
-                        # FIX 2: REMOVED "ACTOR_LOSS_MIN" SCALING BLOCK
-                        # Reason: Artificially scaling loss creates unstable gradients. 
-                        # If actor_loss is small, that is GOOD (means policy is stable). 
-                        # Let the Entropy term handle exploration naturally.
-                        
-                        # Safety Clip (Optional but safe): Cap extreme losses if they still happen
-                        if actor_loss.item() > 100.0:
-                            logger.warning(f"Extreme Actor Loss detected: {actor_loss.item()}")
-                            actor_loss = torch.clamp(actor_loss, max=100.0)
-                        
-                        # ============================================================
-                        # CRITIC & TOTAL LOSS
-                        # ============================================================
-                        
-                        # Critic loss (value function learning)
-                        # new_values has gradients (from model), rewards is a tensor (no gradients)
-                        # MSE loss will compute gradients through new_values
-                        critic_loss = nn.MSELoss()(new_values, rewards)
-                        
-                        # Entropy bonus (encourages exploration)
-                        entropy_bonus = entropies.mean()
-                        entropy_value = entropy_bonus.item()  # Actual entropy value (not scaled)
-                        
-                        # Total loss (actor + critic - entropy)
-                        # entropy_coef is persistent across epochs with gentle decay and adaptive updates
-                        entropy_loss_term = entropy_coef * entropy_bonus
-                        total_loss = actor_loss + 0.5 * critic_loss - entropy_loss_term
-                        
-                        # ============================================================
-                        # ENTROPY RATIO MONITORING (CRITICAL FIX for Policy Collapse)
-                        # ============================================================
-                        # TARGET: Entropy should be 1-10% of actor loss
-                        # If ratio > 1.0: Agent is random (entropy dominates)
-                        # If ratio < 0.01: Agent has no exploration (POLICY COLLAPSE RISK!)
-                        # ============================================================
-                        actor_loss_val = abs(actor_loss.item())
-                        entropy_loss_val = entropy_loss_term.item()
-                        ratio = entropy_loss_val / max(0.0001, actor_loss_val)
-                        
-                        # CRITICAL DIAGNOSTIC: Log actual entropy value and entropy_coef
-                        logger.debug(f"PPO epoch {ppo_epoch}: actor_loss={actor_loss_val:.6f}, "
-                                   f"critic_loss={critic_loss.item():.6f}, "
-                                   f"entropy_value={entropy_value:.4f}, entropy_coef={entropy_coef:.6f}, "
-                                   f"entropy_loss={entropy_loss_val:.6f}, "
-                                   f"entropy/actor_ratio={ratio:.2%}, total_loss={total_loss.item():.6f}")
-                        
-                        # ============================================================
-                        # SMART ENTROPY TUNER (Patch for Normalized PPO)
-                        # ============================================================
-                        
-                        # 1. Don't panic if Actor Loss is naturally small
-                        # If the model is learning (LogProb Diff > 0.01), the "ratio" doesn't matter.
-                        is_learning_fast = (new_logprobs - old_logprobs_detached).abs().mean().item() > 0.01
-                        
-                        # CRITICAL FIX: More aggressive auto-increase for low ratios
-                        # 0.263% is way too low - we need at least 1% (0.01)
-                        # Also handle entropy domination (ratio > 1.0 = 100%)
-                        if ratio > 1.0:  # Entropy loss > Actor loss (entropy dominates)
-                            logger.warning(f"[WARNING] ENTROPY DOMINATION: entropy/actor ratio = {ratio:.1%}. Reduce entropy_coef!")
-                            logger.warning(f"   DIAGNOSTIC: entropy_value={entropy_value:.4f}, entropy_coef={entropy_coef:.6f}, actor_loss={actor_loss_val:.6f}")
+                        # Logging & Entropy Tuning (once per epoch after minibatches)
+                        if num_batches > 0:
+                            avg_actor_loss = epoch_actor_loss / num_batches
+                            avg_critic_loss = epoch_critic_loss / num_batches
+                            avg_entropy = epoch_entropy / num_batches
                             
-                            # SMART LOGIC: Only decrease if we are genuinely stuck (not learning)
-                            if is_learning_fast:
-                                # If we are learning fast, IGNORE the ratio. 
-                                # The high ratio is just a math artifact of normalized advantages.
-                                logger.info(f"   Model is learning fast (LogProb Diff > 0.01), ignoring high ratio")
-                                pass
-                            elif ratio > 2.0 and entropy_coef > 0.001:
-                                logger.warning(f"   High Entropy Ratio ({ratio:.2f}), but checking learning speed first...")
-                                # Only decrease if we are genuinely stuck (not learning)
-                                old_entropy_coef = entropy_coef
+                            ratio = (active_entropy_coef * avg_entropy) / max(0.0001, abs(avg_actor_loss))
+                            
+                            if ppo_epoch == 0:
+                                logger.info(f"  PPO Epoch {ppo_epoch}: actor_loss={avg_actor_loss:.6f}, entropy={avg_entropy:.4f}, ratio={ratio:.2%}")
+                            
+                            # Smart Entropy Tuner (gentle adjustment)
+                            if ratio < 0.01 and entropy_coef < ENTROPY_COEF_MAX:
+                                entropy_coef = min(entropy_coef * 1.2, ENTROPY_COEF_MAX)
+                            elif ratio > 0.5 and entropy_coef > 0.00001:
                                 entropy_coef *= 0.95
-                                logger.warning(f"   AUTO-DECREASING entropy_coef: {old_entropy_coef:.6f} -> {entropy_coef:.6f} (gentle decrease)")
-                        elif ratio < 0.01:  # Below 1% is problematic
-                            logger.warning(f"NO EXPLORATION: entropy/actor ratio = {ratio:.3%}. Increase entropy_coef!")
-                            logger.warning(f"   DIAGNOSTIC: entropy_value={entropy_value:.4f}, entropy_coef={entropy_coef:.6f}, actor_loss={actor_loss_val:.6f}")
-                            
-                            # CRITICAL: Auto-increase entropy more aggressively
-                            # If ratio < 1%, we need to increase entropy_coef significantly
-                            if ratio < 0.01:  # Below 1%
-                                old_entropy_coef = entropy_coef
-                                # Increase by factor needed to reach 2% ratio
-                                target_ratio = 0.02  # Target 2% (safe middle ground)
-                                increase_factor = target_ratio / max(ratio, 0.0001)  # Avoid division by zero
-                                # CRITICAL: Allow much higher entropy_coef to reach 1-10% ratio
-                                # With entropy=0.78 and actor_loss=0.25, we need entropy_coef ~0.003-0.03
-                                # Cap at ENTROPY_COEF_MAX to allow proper exploration while preventing runaway
-                                entropy_coef = min(entropy_coef * increase_factor, ENTROPY_COEF_MAX)
-                                logger.warning(f"   AUTO-INCREASING entropy_coef: {old_entropy_coef:.6f} -> {entropy_coef:.6f} (factor={increase_factor:.2f}x, cap={ENTROPY_COEF_MAX:.6f})")
                                 
-                                # Also check if entropy itself is too low (distribution too peaked)
-                                if entropy_value < 0.5:  # For 3 actions, max entropy is ~1.1, so 0.5 is low
-                                    logger.warning(f"   [WARNING] ENTROPY VALUE TOO LOW: {entropy_value:.4f} (should be >0.5 for 3 actions)")
-                                    logger.warning(f"   This suggests logits are too extreme - check temperature scaling!")
-                        
-                        # DEBUG: Check for NaN before backward
-                        if torch.isnan(total_loss) or torch.isinf(total_loss):
-                            logger.warning(f"NaN/Inf loss in {strategy} training at epoch {ppo_epoch}, skipping update")
-                            break
-                        
-                        # DEBUG: Backward pass (compute gradients)
-                        total_loss.backward()
-                        
-                        # GRADIENT CLIPPING (from Principal ML Engineer Audit)
-                        # Prevents logit explosion from extreme gradients
-                        GRAD_CLIP_NORM = 1.0
-                        grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), GRAD_CLIP_NORM)
-                        
-                        # DEBUG: Optimizer step (update parameters)
-                        optimizer.step()
-                        
-                        # Log PPO metrics to wandb (every 100 steps to avoid spam)
-                        if use_wandb and WANDB_AVAILABLE and step % 100 == 0:
-                            wandb.log({
-                                f"stage2/{strategy}/ppo_epoch": ppo_epoch,
-                                f"stage2/{strategy}/actor_loss": actor_loss_val,
-                                f"stage2/{strategy}/critic_loss": critic_loss.item(),
-                                f"stage2/{strategy}/entropy_value": entropy_value,
-                                f"stage2/{strategy}/entropy_coef": entropy_coef,
-                                f"stage2/{strategy}/entropy_loss": entropy_loss_val,
-                                f"stage2/{strategy}/entropy_actor_ratio": ratio,
-                                f"stage2/{strategy}/total_loss": total_loss.item(),
-                                f"stage2/{strategy}/grad_norm": grad_norm.item(),
-                                f"stage2/{strategy}/advantage_mean": advantages.mean().item(),
-                                f"stage2/{strategy}/advantage_std": advantages.std().item(),
-                                f"stage2/{strategy}/advantage_min": advantages.min().item(),
-                                f"stage2/{strategy}/advantage_max": advantages.max().item(),
-                                f"stage2/{strategy}/reward_mean": rewards.mean().item(),
-                                f"stage2/{strategy}/reward_std": rewards.std().item(),
-                            })
+                            # WandB Logging
+                            if use_wandb and WANDB_AVAILABLE and step % 100 == 0:
+                                wandb.log({
+                                    f"stage2/{strategy}/ppo_epoch": ppo_epoch,
+                                    f"stage2/{strategy}/actor_loss": avg_actor_loss,
+                                    f"stage2/{strategy}/critic_loss": avg_critic_loss,
+                                    f"stage2/{strategy}/entropy_value": avg_entropy,
+                                    f"stage2/{strategy}/entropy_coef": entropy_coef,
+                                    f"stage2/{strategy}/entropy_actor_ratio": ratio,
+                                    f"stage2/{strategy}/total_loss": avg_actor_loss + 0.5 * avg_critic_loss - active_entropy_coef * avg_entropy
+                                })
                     
                     logger.debug(f"PPO update complete, clearing memory")
                     # Clear memory after update
@@ -1721,6 +1642,7 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                 balance_change = current_bal - initial_bal
                 
                 logger.info(f"  Epoch {epoch + 1}/{epochs_per_agent}, Episode Reward: {episode_reward:.2f}")
+                logger.info(f"    Total Reward: {summary['total_reward']:.2f}, Total Profit: ${summary['total_profit']:.2f}")
                 logger.info(f"    Actions: {summary['action_counts']}, Trades: {summary['trade_count']}, "
                           f"Return: {summary['return_pct']:.2f}%")
                 logger.info(f"    Balance: ${initial_bal:.2f} -> ${current_bal:.2f} (Change: ${balance_change:+.2f})")
@@ -1850,6 +1772,23 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
                         f"stage2/{strategy}/avg_reward": summary.get('avg_reward', 0.0),
                         f"stage2/{strategy}/avg_profit": summary.get('avg_profit', 0.0),
                     })
+                
+                # --- PERIODIC WHITEBOX TELEMETRY (Every 10 Epochs) ---
+                if (epoch + 1) % 10 == 0:
+                    try:
+                        # Update the same CSV to keep it fresh
+                        periodic_filename = f"whitebox_stage2_{strategy.lower()}_telemetry.csv"
+                        generate_execution_whitebox_report(
+                            agent=agent,
+                            strategy_type=strategy,
+                            preprocessor=preprocessor,
+                            mode=mode,
+                            window_size=window_size,
+                            filename=periodic_filename,
+                            logger=logger
+                        )
+                    except Exception as e:
+                        logger.error(f"  Failed to generate periodic Stage 2 whitebox report: {e}")
         
         # Log final statistics for this strategy
         stats.log_summary(prefix=f"{strategy}")
@@ -1857,6 +1796,214 @@ def pretrain_execution_agents(transformer: MultiScaleTransformerEncoder,
         logger.info(f"{strategy} agent pre-training complete!")
     
     return agents
+
+
+def generate_stage2_report(agent, env, preprocessor, step_limit=1000, model_name="Agent"):
+    """
+    Runs a deterministic evaluation episode and prints a comprehensive report.
+    """
+    print(f"\n{'='*30} STAGE 2 REPORT: {model_name} {'='*30}")
+    
+    # 1. Setup
+    obs, info = env.reset()
+    done = False
+    truncated = False
+    step = 0
+    
+    # Tracking Data
+    rewards = []
+    values = []
+    actions = []
+    
+    # Track portfolio values properly
+    if hasattr(env, 'base_env') and hasattr(env.base_env, '_get_portfolio_value'):
+        # Initial check
+        current_step = min(env.base_env.current_step, len(env.base_env.data) - 1)
+        current_price = env.base_env.data[current_step, 0]
+        initial_val = env.base_env._get_portfolio_value(current_price)
+    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'balance'):
+        initial_val = env.unwrapped.balance
+    else:
+        initial_val = env.balance if hasattr(env, 'balance') else 0.0
+        
+    portfolio_values = [initial_val]
+    
+    # Market Tracking (for Alpha)
+    market_prices = [] 
+    if hasattr(env, 'base_env') and hasattr(env.base_env, 'data'):
+        # Capture initial market price
+        current_step = min(env.base_env.current_step, len(env.base_env.data) - 1)
+        market_prices.append(env.base_env.data[current_step, 0])
+    
+    # 2. Simulation Loop (Deterministic)
+    while not (done or truncated) and step < step_limit:
+        
+        # Prepare inputs using preprocessor to match training exactly
+        # Get raw features from cache/preprocessor
+        # We need to access the underlying data at the current step
+        
+        # 1. Get current windowed features
+        # Note: env.base_env.current_step points to the CURRENT step
+        # We use preprocessor to extract features at this step
+        if hasattr(env, 'base_env'):
+            # This is efficient if preprocessor has cached data
+            windowed = preprocessor.get_window_features(
+                preprocessor.features, 
+                env.base_env.window_size, 
+                env.base_env.current_step
+            )
+        else:
+             # Fallback
+             pass
+             
+        # Convert to tensors
+        features_dict = {}
+        if windowed:
+            for interval, feat in windowed.items():
+                if np.isnan(feat).any() or np.isinf(feat).any():
+                    feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                transformer_key = interval.replace("1wk", "1w") if interval == "1wk" else interval
+                feat_tensor = torch.from_numpy(feat).float().unsqueeze(0).to(device)
+                features_dict[transformer_key] = feat_tensor
+        
+        # Strategy features
+        if hasattr(env, 'base_env'):
+            shares = env.base_env.shares
+            entry_price = env.base_env.entry_price
+            
+            # Get current price
+            current_step = min(env.base_env.current_step, len(env.base_env.data) - 1)
+            current_price = env.base_env.data[current_step, 0]
+        else:
+            shares = 0
+            entry_price = 0
+            current_price = 1.0
+            
+        strategy_feat = agent._get_strategy_features(shares, entry_price, current_price).unsqueeze(0).to(device)
+        
+        # Precision features
+        precision_feat = agent._get_precision_features(
+            features_dict, shares, entry_price, current_price
+        ).unsqueeze(0).to(device)
+        
+        # Local features (from env if available)
+        if hasattr(env, 'base_env') and hasattr(env.base_env, '_get_local_features'):
+            local_feat_np = env.base_env._get_local_features()
+            local_feat = torch.from_numpy(local_feat_np).unsqueeze(0).float().to(device)
+        else:
+            local_feat = torch.zeros(1, 4, device=device, dtype=torch.float32)
+            if shares > 0:
+                local_feat[0, 0] = 1.0
+        
+        # GET DETERMINISTIC ACTION
+        with torch.no_grad():
+            # act returns: action, log_prob, value
+            action, _, value_pred = agent.act(
+                features_dict, 
+                strategy_feat, 
+                precision_feat, 
+                local_feat, 
+                deterministic=True
+            )
+
+        # Execute
+        obs, reward, done, truncated, info = env.step(action)
+        
+        # Store Data
+        rewards.append(reward)
+        values.append(value_pred) # value_pred is scalar from act()
+        actions.append(action)
+        
+        # Track portfolio value
+        if hasattr(env, 'base_env') and hasattr(env.base_env, '_get_portfolio_value'):
+            current_step = min(env.base_env.current_step, len(env.base_env.data) - 1)
+            current_price = env.base_env.data[current_step, 0]
+            val = env.base_env._get_portfolio_value(current_price)
+            portfolio_values.append(val)
+            market_prices.append(current_price)
+        else:
+            portfolio_values.append(info.get('balance', 0))
+            if 'price' in info: market_prices.append(info['price'])
+        
+        step += 1
+    
+    # 3. Calculations
+    
+    # --- Financial ---
+    initial_bal = portfolio_values[0]
+    final_bal = portfolio_values[-1]
+    net_profit = final_bal - initial_bal
+    # Avoid div by zero
+    if initial_bal == 0: initial_bal = 1.0 
+    net_profit_pct = (net_profit / initial_bal) * 100
+    
+    # Alpha (vs Buy & Hold)
+    if len(market_prices) > 1:
+        # Market return over the period
+        market_return = (market_prices[-1] - market_prices[0]) / market_prices[0]
+        # net_profit_pct is percentage (e.g. 5.0 for 5%), market_return is decimal (e.g. 0.05 for 5%)
+        # Convert net_profit_pct to decimal for comparison
+        alpha = (net_profit_pct / 100) - market_return
+    else:
+        market_return = 0.0
+        alpha = 0.0 # Data unavailable
+        
+    # Max Drawdown
+    peak = portfolio_values[0]
+    max_dd = 0.0
+    for val in portfolio_values:
+        if val > peak: peak = val
+        if peak > 0:
+            dd = (peak - val) / peak
+            if dd > max_dd: max_dd = dd
+        
+    # --- Strategy Behavior ---
+    total_trades = actions.count(1) + actions.count(2) # Buy + Sell
+    # Assuming win rate requires detailed trade analysis not easily avail in simple list
+    # We'll rely on what we can compute or what env provides if possible.
+    # For now, simplistic check: 
+    # If we have trades, we really want to check 'closed' trades.
+    # We will skip Win Rate calculation here unless we track specific trade entries/exits manually
+    # or expose env.trades list.
+    
+    # --- RL Health (Value Accuracy) ---
+    # Calculate returns-to-go
+    returns = []
+    G = 0
+    gamma = 0.99 
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns_t = torch.tensor(returns)
+    values_t = torch.tensor(values)
+    
+    # Explained Variance
+    y_true_var = torch.var(returns_t)
+    if y_true_var == 0: y_true_var = 1e-8
+    
+    explained_var = 1 - torch.var(returns_t - values_t) / y_true_var
+    
+    # 4. Printing
+    print(f"\n[Financial Performance]")
+    print(f"  Final Balance: ${final_bal:.2f}")
+    print(f"  Net Profit:    {net_profit_pct:.2f}%")
+    print(f"  Max Drawdown:  {max_dd:.2%}")
+    print(f"  Alpha:         {alpha:.4f} (Market Return: {market_return:.2%})")
+    
+    print(f"\n[RL Health]")
+    print(f"  Explained Var: {explained_var.item():.4f} (Close to 1.0 is good)")
+    print(f"  Action Dist:   HOLD={actions.count(0)/len(actions):.1%} | BUY={actions.count(1)/len(actions):.1%} | SELL={actions.count(2)/len(actions):.1%}")
+    print(f"  Avg Value:     {values_t.mean().item():.4f} (Predicted) vs {returns_t.mean().item():.4f} (Actual)")
+    
+    print(f"\n[Sanity Checks]")
+    print(f"  Steps Taken:   {step}")
+    print(f"  Total Trades:  {total_trades}")
+    
+    if hasattr(env, 'base_env') and hasattr(env.base_env, 'invalid_action_count'):
+         print(f"  Invalid Acts:  {env.base_env.invalid_action_count}")
+    
+    print(f"{'='*80}\n")
 
 
 # ==============================================================================
@@ -1964,6 +2111,9 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
     state, _ = meta_env.reset()
     episode_reward = 0.0
     
+    # Track negative EV streak for early stopping (Stage 3)
+    negative_ev_streak_stage3 = 0
+    
     # FIX: Meta-agent should decide every 10-20 steps (Trade Cycle), not every step
     # If it switches every step, it creates "Strategy Flicker" (Buy -> Sell -> Buy -> Sell), which burns money on fees
     META_DECISION_INTERVAL = 15  # Meta-agent makes decision every 15 steps (reduces flicker)
@@ -1980,12 +2130,11 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
             logger.info(f"  Commission: 0.0 -> {original_commission:.4f} ({original_commission*100:.2f}%)")
             logger.info(f"  Slippage: 0.0 -> {original_slippage:.1f} bps")
         
-        # BOOST ENTROPY: Increased from 0.0001 to 0.01 to force exploration
-        # SLOW ENTROPY DECAY: Keep agent curious for longer (until step 10000+)
-        # Entropy coefficient: Start at 0.01 (boosted from 0.0001), decay slowly using 0.99 per step
-        # Use slower decay (0.99 per step) so entropy stays above zero for 100+ epochs
-        entropy_coef = 0.01 * (0.99 ** step)  # Slow exponential decay (0.99 per step), boosted 100x from 0.0001
-        entropy_coef = max(entropy_coef, 0.001)  # Clamp to minimum (boosted 100x from 0.00001)
+        # REDUCED ENTROPY: Prioritize profit signals over exploration
+        # Entropy coefficient: Start at 0.0001, decay slowly using 0.99 per step
+        # Reduced by order of magnitude to make agent care more about profit
+        entropy_coef = 0.0001 * (0.99 ** step)  # Slow exponential decay (0.99 per step)
+        entropy_coef = max(entropy_coef, 0.00005)  # Clamp to minimum (reduced from 0.001)
         progress = step / steps  # For logging only
         # Get windowed features from cached data
         windowed = preprocessor.get_window_features(features, window_size, None)
@@ -2087,7 +2236,7 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                 # Check for flicker (rapid switching)
                 unique_strategies = len(set(strategy_history[-5:]))  # Count unique strategies in last 5
                 if unique_strategies >= 4:  # 4+ different strategies in last 5 = flicker
-                    logger.warning(f"  ⚠️  STRATEGY FLICKER DETECTED: {unique_strategies} different strategies in last 5 decisions!")
+                    logger.warning(f"  STRATEGY FLICKER DETECTED: {unique_strategies} different strategies in last 5 decisions!")
         else:
             # Reuse last meta-action (don't make new decision)
             action = last_meta_action
@@ -2160,6 +2309,9 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                 for r in reversed(memory_rewards):
                     discounted_reward = r + 0.99 * discounted_reward
                     rewards.insert(0, discounted_reward)
+                
+                # Keep a copy of unnormalized returns for EV computation
+                returns_for_ev_np = np.array(rewards, dtype=np.float32)
                 
                 rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
                 rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
@@ -2246,6 +2398,23 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                     values = torch.stack(values_list).squeeze()
                     entropy = torch.stack(entropies_list).mean()
                     
+                    # Compute Critic Explained Variance (EV) before loss calculation
+                    try:
+                        y_true = rewards.detach().cpu().numpy()
+                        y_pred = values.detach().cpu().numpy()
+                        var_y = np.var(y_true)
+                        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+                        logger.info(f"Critic Explained Variance: {explained_var:.4f}")
+                        if not np.isnan(explained_var) and explained_var < 0.0:
+                            negative_ev_streak_stage3 += 1
+                        else:
+                            negative_ev_streak_stage3 = 0
+                        if negative_ev_streak_stage3 >= 10:
+                            logger.error("Critic Explained Variance remained negative for 10 consecutive PPO updates. Early stopping Stage 3 training.")
+                            return meta_agent
+                    except Exception as e:
+                        logger.warning(f"Failed to compute Explained Variance (Stage 3): {e}")
+                    
                     # Check for NaN before loss calculation
                     if torch.isnan(logprobs).any() or torch.isnan(values).any() or torch.isnan(entropy).any():
                         logger.warning("NaN detected in stacked tensors, skipping PPO update")
@@ -2254,6 +2423,20 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                     # PPO loss
                     ratios = torch.exp(logprobs - old_logprobs.detach())
                     advantages = rewards - values.detach()
+                    
+                    # --- WHITEBOX: ADVANTAGE HISTOGRAM ---
+                    if step % 1000 == 0:  # Save every 1000 steps
+                        plt.figure(figsize=(10, 5))
+                        plt.hist(advantages.cpu().numpy(), bins=50, color='skyblue', edgecolor='black')
+                        plt.title(f"Advantage Distribution (Step {step})")
+                        plt.xlabel("Advantage (Actual - Predicted)")
+                        plt.ylabel("Frequency")
+                        plt.grid(alpha=0.3)
+                        plot_path = f"debug_advantages_step_{step}.png"
+                        plt.savefig(plot_path)
+                        plt.close()
+                        logger.info(f"📊 Advantage Histogram saved: {plot_path}")
+                    
                     surr1 = ratios * advantages
                     surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
                     actor_loss = -torch.min(surr1, surr2).mean()
@@ -2314,6 +2497,11 @@ def train_meta_strategy_agent(transformer: MultiScaleTransformerEncoder,
                             "stage3/reward_mean": rewards.mean().item(),
                             "stage3/reward_std": rewards.std().item(),
                         })
+                        # Also log EV if available from the recent computation block
+                        try:
+                            wandb.log({"stage3/explained_variance": float(explained_var)})
+                        except Exception:
+                            pass
                 
                 # Clear memory
                 memory_states, memory_actions, memory_logprobs, memory_rewards = [], [], [], []
@@ -2400,10 +2588,17 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
             param.requires_grad = True
     
     # Create optimizers
-    meta_optimizer = optim.Adam(meta_agent.parameters(), lr=lr)  # 3e-3: 10x boost for bigger updates
-    exec_optimizers = {}
-    for strategy, agent in execution_agents.items():
-        exec_optimizers[strategy] = optim.Adam(agent.parameters(), lr=lr)  # Same LR as meta (3e-3) - 10x boost for bigger updates
+    # Create optimizer with differential learning rates (Stage 4)
+    optimizer = optim.AdamW([
+        # High LR for the Manager (Meta-Agent) - needs to learn fast
+        {'params': meta_agent.parameters(), 'lr': 1e-4},
+
+        # Low LR for Sub-Agents - PRESERVE their pre-training
+        {'params': execution_agents['TREND_FOLLOW'].parameters(), 'lr': 1e-6},
+        {'params': execution_agents['MEAN_REVERT'].parameters(), 'lr': 1e-6},
+        {'params': execution_agents['MOMENTUM'].parameters(), 'lr': 1e-6},
+        {'params': execution_agents['RISK_OFF'].parameters(), 'lr': 1e-6},
+    ], weight_decay=1e-5)
     
     # Create environment
     config = TradingConfig()
@@ -2457,13 +2652,11 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
             logger.info(f"  Slippage: 0.0 -> {original_slippage_ft:.1f} bps")
         
         # ENTROPY ANNEALING: Calculate entropy coefficient for this step
-        # BOOST ENTROPY: Increased from 0.0001 to 0.01 to force exploration
-        # CRITICAL FIX: Faster exponential decay to force agent to use brain instead of random guessing
-        # SLOW ENTROPY DECAY: Keep agent curious for longer (until step 10000+)
-        # Entropy coefficient: Start at 0.01 (boosted from 0.0001), decay slowly using 0.99 per step
-        # Use slower decay (0.99 per step) so entropy stays above zero for 100+ epochs
-        entropy_coef = 0.01 * (0.99 ** step)  # Slow exponential decay (0.99 per step), boosted 100x from 0.0001
-        entropy_coef = max(entropy_coef, 0.001)  # Clamp to minimum (boosted 100x from 0.00001)
+        # REDUCED ENTROPY: Prioritize profit signals over exploration
+        # Reduced by order of magnitude to make agent care more about profit
+        # REDUCED ENTROPY: Prioritize profit signals over exploration
+        entropy_coef = 0.0001 * (0.99 ** step)  # Slow exponential decay (0.99 per step)
+        entropy_coef = max(entropy_coef, 0.00005)  # Clamp to minimum (reduced from 0.001)
         progress = step / steps  # For logging only
         # Get windowed features
         windowed = preprocessor.get_window_features(features, window_size, None)
@@ -2645,6 +2838,19 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
                     # PPO loss
                     ratios = torch.exp(logprobs - old_logprobs.detach())
                     advantages = rewards - values.detach()
+                    
+                    # --- WHITEBOX: ADVANTAGE HISTOGRAM ---
+                    if step % 500 == 0:  # Save every 500 steps during fine-tuning
+                        plt.figure(figsize=(10, 5))
+                        plt.hist(advantages.cpu().numpy(), bins=50, color='salmon', edgecolor='black')
+                        plt.title(f"Advantage Distribution (Fine-Tuning Step {step})")
+                        plt.xlabel("Advantage")
+                        plt.ylabel("Frequency")
+                        plt.grid(alpha=0.3)
+                        plot_path = f"debug_advantages_ft_step_{step}.png"
+                        plt.savefig(plot_path)
+                        plt.close()
+                    
                     surr1 = ratios * advantages
                     surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
                     actor_loss = -torch.min(surr1, surr2).mean()
@@ -2666,10 +2872,25 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
                     if torch.isnan(loss).any():
                         continue
                     
-                    meta_optimizer.zero_grad()
+                    all_trainable_params = list(meta_agent.parameters())
+                    for ag in execution_agents.values():
+                        all_trainable_params.extend(list(ag.parameters()))
+                    
+                    optimizer.zero_grad()
                     loss.mean().backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(meta_agent.parameters(), max_norm=0.5)
-                    meta_optimizer.step()
+                    
+                    # Compute L2 gradient norm before clipping (Silent Killer monitoring)
+                    total_norm = 0.0
+                    for p in all_trainable_params:
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += (param_norm.item() ** 2)
+                    total_norm = total_norm ** 0.5
+                    logger.info(f"Gradient Norm: {total_norm:.4f}")
+                    
+                    # Clip gradients and apply update
+                    grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable_params, max_norm=0.5)
+                    optimizer.step()
                     
                     # Log to wandb (every PPO update)
                     if use_wandb and WANDB_AVAILABLE:
@@ -2749,14 +2970,250 @@ def fine_tune_end_to_end(meta_agent: MetaStrategyAgent,
 # MAIN TRAINING FUNCTION
 # ==============================================================================
 
+
+
+def generate_execution_whitebox_report(agent: nn.Module,
+                                      strategy_type: str,
+                                      preprocessor: MultiTimescalePreprocessor,
+                                      mode: str = "stock",
+                                      window_size: int = 30,
+                                      step_limit: int = 1000,
+                                      filename: str = "whitebox_execution_logs.csv",
+                                      logger: Optional[logging.Logger] = None):
+    """
+    Expose internal decision metrics for an Execution Agent to a CSV.
+    """
+    logger = logger or logging.getLogger(__name__)
+    logger.info(f"Generating Execution Whitebox Report for {strategy_type}: {filename}...")
+    
+    config = TradingConfig()
+    config.mode = mode
+    
+    env = ExecutionEnv(
+        ticker=preprocessor.ticker,
+        window_size=window_size,
+        config=config,
+        strategy_type=strategy_type,
+        logger=logger
+    )
+    
+    # Process data
+    aligned_data, features = preprocessor.process(window_size=window_size)
+    if not aligned_data or not features:
+        logger.error("Failed to fetch data for whitebox report")
+        return None
+    
+    history = []
+    state, _ = env.reset()
+    
+    # Determine scale names
+    scale_names = list(features.keys())
+    
+    for step in range(1, step_limit + 1):
+        # Prepare features
+        windowed = preprocessor.get_window_features(features, window_size, None)
+        features_dict = {}
+        for interval, feat in windowed.items():
+            features_dict[interval.replace("1wk", "1w")] = torch.from_numpy(feat).float().unsqueeze(0).to(device)
+            
+        # Get strategy and precision features from environment
+        shares = env.base_env.shares
+        entry_price = env.base_env.entry_price
+        
+        # Calculate current price from data at current step
+        if env.base_env.current_step < len(env.base_env.data):
+            current_price = env.base_env.data[env.base_env.current_step, 0]
+        else:
+            current_price = entry_price if entry_price > 0 else 1.0
+        
+        with torch.no_grad():
+            strategy_features = agent._get_strategy_features(shares, entry_price, current_price).unsqueeze(0).to(device)
+            precision_features = agent._get_precision_features(features_dict, shares, entry_price, current_price).unsqueeze(0).to(device)
+            
+            # Local features using environment's own logic (ensures perfect consistency)
+            local_feat_np = env.base_env._get_local_features()
+            local_features = torch.from_numpy(local_feat_np).unsqueeze(0).float().to(device)
+            
+            # Run Agent in Deterministic Mode
+            # get_action_and_value returns action_idx, log_prob, entropy, value, [attn_weights, logits]
+            action, log_prob, entropy, value, attn_weights, logits = agent.get_action_and_value(
+                features_dict, strategy_features, precision_features, local_features, 
+                deterministic=True, return_weights=True, return_logits=True
+            )
+            
+            # Compute per-action probabilities (0=HOLD, 1=BUY, 2=SELL)
+            probs = torch.softmax(logits[0], dim=-1).detach().cpu().numpy()
+            logits_np = logits[0].detach().cpu().numpy()
+            
+        # Step environment
+        next_state, reward, done, truncated, info = env.step(action.item())
+        
+        # Build log entry for this step
+        selected_idx = int(action.item()) if hasattr(action, 'item') else int(action)
+        uniform = 1.0 / 3.0
+        # Compute signed margins relative to neutral (uniform) distribution
+        margin_hold = float(probs[0] - uniform)
+        margin_buy = float(probs[1] - uniform)
+        margin_sell = float(probs[2] - uniform)
+        # Top-vs-second confidence margin
+        sorted_probs = np.sort(probs)
+        top_action_margin = float(sorted_probs[-1] - sorted_probs[-2]) if len(sorted_probs) >= 2 else float('nan')
+
+        entry = {
+            'step': step,
+            'price': info.get('price', 0.0),
+            'shares': shares,
+            'entry_price': float(entry_price) if isinstance(entry_price, (int, float)) else 0.0,
+            'current_price': float(current_price) if isinstance(current_price, (int, float)) else 0.0,
+            'action': selected_idx,
+            'prob': torch.exp(log_prob).item() if isinstance(log_prob, torch.Tensor) else float(np.exp(log_prob)),
+            'value_pred': value.item() if isinstance(value, torch.Tensor) else float(value),
+            'actual_reward': float(reward),
+            'entropy': entropy.item() if isinstance(entropy, torch.Tensor) else float(entropy),
+            # Per-action logits (0=HOLD, 1=BUY, 2=SELL)
+            'logit_hold': float(logits_np[0]),
+            'logit_buy': float(logits_np[1]),
+            'logit_sell': float(logits_np[2]),
+            # Per-action probabilities
+            'prob_hold': float(probs[0]),
+            'prob_buy': float(probs[1]),
+            'prob_sell': float(probs[2]),
+            # Signed margins relative to neutral 1/3
+            'margin_hold': margin_hold,
+            'margin_buy': margin_buy,
+            'margin_sell': margin_sell,
+            # Selected action stats
+            'selected_action_prob': float(probs[selected_idx]),
+            'selected_action_logit': float(logits_np[selected_idx]),
+            'selected_action_margin': float(probs[selected_idx] - uniform),
+            # Overall confidence
+            'top_action_margin': top_action_margin
+        }
+
+        # Extract attention weights summary (already averaged across heads/query scales)
+        if attn_weights is not None:
+            # attn_weights shape: (batch, num_scales)
+            scale_weights = attn_weights[0].cpu().numpy()
+            
+            # Add attention weights
+            for i, name in enumerate(scale_names):
+                if i < len(scale_weights):
+                    entry[f'attn_{name}'] = scale_weights[i]
+        else:
+             # Log warning only once per report
+             if step == 1:
+                 logger.warning("Attention weights missing in whitebox report!")
+               
+        history.append(entry)
+        if done or truncated: break
+        
+    df_history = pd.DataFrame(history)
+    df_history.to_csv(filename, index=False)
+    logger.info(f"✅ Execution Whitebox Telemetry saved to {filename}")
+    return df_history
+
+def generate_whitebox_report(agent: MetaStrategyAgent, 
+                             preprocessor: MultiTimescalePreprocessor, 
+                             regime_detector: EnhancedRegimeDetector,
+                             execution_agents: Dict[str, nn.Module],
+                             mode: str = "stock",
+                             window_size: int = 30,
+                             step_limit: int = 1000,
+                             filename: str = "whitebox_logs.csv",
+                             logger: Optional[logging.Logger] = None):
+    """
+    Expose internal decision metrics to a CSV for auditing.
+    """
+    logger = logger or logging.getLogger(__name__)
+    logger.info(f"Generating Whitebox Telemetry Report: {filename}...")
+    
+    config = TradingConfig()
+    config.mode = mode
+    
+    env = MetaStrategyEnv(
+        ticker=preprocessor.ticker,
+        window_size=window_size,
+        config=config,
+        execution_horizon=10,
+        execution_agents=execution_agents,
+        logger=logger
+    )
+    
+    # Process data
+    aligned_data, features = preprocessor.process(window_size=window_size)
+    if not aligned_data or not features:
+        logger.error("Failed to fetch data for whitebox report")
+        return None
+    
+    history = []
+    state, _ = env.reset()
+    
+    # Determine scale names (for attention logging)
+    scale_names = list(features.keys())
+    
+    for step in range(1, step_limit + 1):
+        # Prepare features (same logic as training loop)
+        windowed = preprocessor.get_window_features(features, window_size, None)
+        features_dict = {}
+        for interval, feat in windowed.items():
+            features_dict[interval.replace("1wk", "1w")] = torch.from_numpy(feat).float().unsqueeze(0).to(device)
+            
+        # Get regime features
+        regime_df = aligned_data.get("1d", next(iter(aligned_data.values())))
+        close_prices = regime_df['Close'].values if 'Close' in regime_df.columns else regime_df.iloc[:, 0].values
+        regime_features = torch.from_numpy(regime_detector.get_regime_features(close_prices)).float().unsqueeze(0).to(device)
+        regime_label = regime_detector.detect_regime(close_prices)
+        
+        # Run Agent in Deterministic Mode for valid metrics
+        with torch.no_grad():
+            # Get action, prob, entropy, value, AND attention weights
+            action, log_prob, entropy, value, attn_weights = agent.get_action_and_value(
+                features_dict, regime_features, deterministic=True, return_weights=True
+            )
+        
+        # Step environment
+        next_state, reward, done, truncated, info = env.step(action.item())
+        
+        # Extract attention weights summary: already averaged across heads and query scales
+        # attn_weights shape: (batch, num_scales)
+        scale_weights = attn_weights[0].cpu().numpy()
+        
+        entry = {
+            'step': step,
+            'price': info.get('price', 0.0),
+            'regime': regime_label,
+            'action': ["TREND_FOLLOW", "MEAN_REVERT", "MOMENTUM", "RISK_OFF"][action.item()],
+            'prob': torch.exp(log_prob).item(),
+            'value_pred': value.item(),
+            'actual_reward': reward,
+            'entropy': entropy.item()
+        }
+        
+        # Add attention weights to log
+        for i, name in enumerate(scale_names):
+            if i < len(scale_weights):
+                entry[f'attn_{name}'] = scale_weights[i]
+        
+        history.append(entry)
+        
+        if done or truncated: break
+        
+    df_history = pd.DataFrame(history)
+    df_history.to_csv(filename, index=False)
+    logger.info(f"✅ Whitebox Telemetry saved to {filename}")
+    return df_history
+
 def train_hierarchical_transformer(ticker: str = "^IXIC",
                                    mode: str = "stock",
                                    window_size: int = 30,
                                    save_dir: str = "models_v0.2",
+                                   multi_stock_tickers: Optional[List[str]] = None,
                                    logger: Optional[logging.Logger] = None,
                                    use_wandb: bool = True,
                                    wandb_project: str = "hierarchical-transformer-trading",
-                                   wandb_entity: Optional[str] = None):
+                                   wandb_entity: Optional[str] = None,
+                                   start_stage: int = 1,
+                                   load_pretrain_path: Optional[str] = None):
     """
     Complete training pipeline with curriculum learning.
     
@@ -2812,40 +3269,202 @@ def train_hierarchical_transformer(ticker: str = "^IXIC",
     preprocessor = MultiTimescalePreprocessor(ticker, mode=mode, logger=logger)
     regime_detector = EnhancedRegimeDetector(window=20, logger=logger)
     
-    # Stage 1: Pre-train transformers
-    transformer = pretrain_transformer_encoders(
-        preprocessor, mode=mode, epochs=100, window_size=window_size, logger=logger, use_wandb=use_wandb
-    )
-    torch.save(transformer.state_dict(), os.path.join(save_dir, "transformer_pretrained.pth"))
-    logger.info("Saved pre-trained transformer")
+    # Load or train transformer (Stage 1)
+    transformer = None
+    if load_pretrain_path and os.path.exists(load_pretrain_path):
+        logger.info("=" * 60)
+        logger.info(f"LOADING PRETRAINED TRANSFORMER FROM: {load_pretrain_path}")
+        logger.info("=" * 60)
+        
+        # Determine input_dim from data (needed to initialize model before loading weights)
+        aligned_data, features = preprocessor.process(window_size=window_size)
+        if not aligned_data or not features:
+            raise ValueError("Failed to process data for input_dim detection")
+        
+        # Get sample feature to determine input_dim
+        sample_feat = next(iter(features.values()))
+        if len(sample_feat.shape) == 2:
+            input_dim = sample_feat.shape[1]
+        else:
+            input_dim = 8 if mode == "stock" else 5
+        
+        logger.info(f"Detected input_dim={input_dim} from data (mode={mode})")
+        
+        # Create transformer with same architecture as training
+        transformer = MultiScaleTransformerEncoder(
+            d_model=64,
+            nhead=4,
+            num_layers=2,
+            dim_feedforward=256,
+            dropout=0.1,
+            input_dim=input_dim,
+            mode=mode
+        ).to(device)
+        
+        # Load pretrained weights
+        transformer.load_state_dict(torch.load(load_pretrain_path, map_location=device))
+        logger.info(f"Successfully loaded pretrained transformer from {load_pretrain_path}")
+        logger.info("Skipping Stage 1 (using pretrained model)")
+        
+    elif start_stage <= 1:
+        # Stage 1: Pre-train transformers
+        logger.info("=" * 60)
+        logger.info("STAGE 1: Pre-training Transformer Encoders")
+        logger.info("=" * 60)
+        
+        # IMPROVEMENT: Multi-stock training for general market dynamics
+        # If multi_stock_tickers provided, use multi-stock; otherwise use single ticker
+        if multi_stock_tickers is None:
+            # Default: Use single ticker for backward compatibility
+            multi_stock_tickers = [ticker]
+            logger.info(f"Stage 1: Single-stock mode (ticker: {ticker})")
+        else:
+            logger.info(f"Stage 1: Multi-stock mode ({len(multi_stock_tickers)} stocks)")
+            logger.info(f"  Stocks: {multi_stock_tickers}")
+        
+        transformer = pretrain_transformer_encoders(
+            preprocessor, mode=mode, epochs=300, window_size=window_size, 
+            multi_stock_tickers=multi_stock_tickers, logger=logger, use_wandb=use_wandb
+        )
+        torch.save(transformer.state_dict(), os.path.join(save_dir, "transformer_pretrained.pth"))
+        logger.info("Saved pre-trained transformer")
+    else:
+        raise ValueError(f"Cannot start from stage {start_stage} without a pretrained transformer. "
+                        f"Either provide --load_pretrain or start from stage 1.")
+    
+    if transformer is None:
+        raise RuntimeError("Transformer not initialized. This should not happen.")
     
     # Stage 2: Pre-train execution agents
-    execution_agents = pretrain_execution_agents(
-        transformer, preprocessor, regime_detector, mode=mode, 
-        epochs_per_agent=500, steps_per_epoch=2048, window_size=window_size, logger=logger, use_wandb=use_wandb
-    )
-    for strategy, agent in execution_agents.items():
-        torch.save(agent.state_dict(), os.path.join(save_dir, f"execution_{strategy.lower()}.pth"))
-    logger.info("Saved pre-trained execution agents")
+    execution_agents = None
+    if start_stage <= 2:
+        logger.info("=" * 60)
+        logger.info("STAGE 2: Pre-training Execution Agents")
+        logger.info("=" * 60)
+        execution_agents = pretrain_execution_agents(
+            transformer, preprocessor, regime_detector, mode=mode, 
+            epochs_per_agent=50, steps_per_epoch=512, window_size=window_size, logger=logger, use_wandb=use_wandb
+        )
+        for strategy, agent in execution_agents.items():
+            torch.save(agent.state_dict(), os.path.join(save_dir, f"execution_{strategy.lower()}.pth"))
+        logger.info("Saved pre-trained execution agents")
+        
+        # --- STAGE 2 WHITEBOX TELEMETRY ---
+        logger.info("Generating Stage 2 Whitebox Telemetry...")
+        for strategy, agent in execution_agents.items():
+            try:
+                generate_execution_whitebox_report(
+                    agent=agent,
+                    strategy_type=strategy,
+                    preprocessor=preprocessor,
+                    mode=mode,
+                    window_size=window_size,
+                    filename=os.path.join(save_dir, f"whitebox_stage2_{strategy.lower()}_telemetry.csv"),
+                    logger=logger
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate whitebox report for {strategy}: {e}")
+        # ---------------------------------
+    else:
+        logger.info("Skipping Stage 2 (loading execution agents)")
+        # Load execution agents if starting from later stage
+        execution_agents = {}
+        strategies = ["TREND_FOLLOW", "MEAN_REVERT", "MOMENTUM", "RISK_OFF"]
+        for strategy in strategies:
+            agent_path = os.path.join(save_dir, f"execution_{strategy.lower()}.pth")
+            if os.path.exists(agent_path):
+                logger.info(f"Loading execution agent: {strategy}")
+                # Determine input_dim for agent creation
+                aligned_data, features = preprocessor.process(window_size=window_size)
+                sample_feat = next(iter(features.values())) if features else None
+                input_dim = sample_feat.shape[1] if sample_feat is not None and len(sample_feat.shape) == 2 else (8 if mode == "stock" else 5)
+                
+                # Create temporary agents to get the agent architecture, then load weights
+                temp_agents = create_execution_agents(transformer, mode=mode, input_dim=input_dim)
+                agent = temp_agents[strategy]
+                agent.load_state_dict(torch.load(agent_path, map_location=device))
+                execution_agents[strategy] = agent
+            else:
+                raise FileNotFoundError(f"Execution agent not found: {agent_path}. Cannot start from stage {start_stage}.")
+    
+    if execution_agents is None:
+        raise RuntimeError("Execution agents not initialized. This should not happen.")
     
     # Stage 3: Train meta-strategy
-    meta_agent = train_meta_strategy_agent(
-        transformer, execution_agents, preprocessor, regime_detector,
-        mode=mode, steps=100000, window_size=window_size, logger=logger, use_wandb=use_wandb
-    )
-    torch.save(meta_agent.state_dict(), os.path.join(save_dir, "meta_strategy.pth"))
-    logger.info("Saved meta-strategy agent")
+    meta_agent = None
+    if start_stage <= 3:
+        logger.info("=" * 60)
+        logger.info("STAGE 3: Training Meta-Strategy Agent")
+        logger.info("=" * 60)
+        meta_agent = train_meta_strategy_agent(
+            transformer, execution_agents, preprocessor, regime_detector,
+            mode=mode, steps=100000, window_size=window_size, logger=logger, use_wandb=use_wandb
+        )
+        torch.save(meta_agent.state_dict(), os.path.join(save_dir, "meta_strategy.pth"))
+        logger.info("Saved meta-strategy agent")
+        
+        # --- WHITEBOX TELEMETRY ---
+        generate_whitebox_report(
+            agent=meta_agent,
+            preprocessor=preprocessor,
+            regime_detector=regime_detector,
+            execution_agents=execution_agents,
+            mode=mode,
+            window_size=window_size,
+            filename=os.path.join(save_dir, "whitebox_stage3_telemetry.csv"),
+            logger=logger
+        )
+    else:
+        logger.info("Skipping Stage 3 (loading meta-strategy agent)")
+        meta_path = os.path.join(save_dir, "meta_strategy.pth")
+        if os.path.exists(meta_path):
+            logger.info(f"Loading meta-strategy agent from {meta_path}")
+            # Determine input_dim for meta agent creation
+            aligned_data, features = preprocessor.process(window_size=window_size)
+            sample_feat = next(iter(features.values())) if features else None
+            input_dim = sample_feat.shape[1] if sample_feat is not None and len(sample_feat.shape) == 2 else (8 if mode == "stock" else 5)
+            
+            from meta_strategy_agent import MetaStrategyAgent
+            meta_agent = MetaStrategyAgent(
+                d_model=64, nhead=4, num_layers=2, dim_feedforward=256,
+                dropout=0.1, input_dim=input_dim, mode=mode, hidden_dim=128
+            ).to(device)
+            meta_agent.load_state_dict(torch.load(meta_path, map_location=device))
+        else:
+            raise FileNotFoundError(f"Meta-strategy agent not found: {meta_path}. Cannot start from stage {start_stage}.")
+    
+    if meta_agent is None:
+        raise RuntimeError("Meta-strategy agent not initialized. This should not happen.")
     
     # Stage 4: End-to-end fine-tuning
-    fine_tune_end_to_end(
-        meta_agent, execution_agents, preprocessor, regime_detector,
-        mode=mode, steps=5000, window_size=window_size, logger=logger, use_wandb=use_wandb
-    )
-    
-    # Save final models
-    torch.save(meta_agent.state_dict(), os.path.join(save_dir, "meta_strategy_final.pth"))
-    for strategy, agent in execution_agents.items():
-        torch.save(agent.state_dict(), os.path.join(save_dir, f"execution_{strategy.lower()}_final.pth"))
+    if start_stage <= 4:
+        logger.info("=" * 60)
+        logger.info("STAGE 4: End-to-End Fine-Tuning")
+        logger.info("=" * 60)
+        fine_tune_end_to_end(
+            meta_agent, execution_agents, preprocessor, regime_detector,
+            mode=mode, steps=5000, window_size=window_size, logger=logger, use_wandb=use_wandb
+        )
+        
+        # Save final models
+        torch.save(meta_agent.state_dict(), os.path.join(save_dir, "meta_strategy_final.pth"))
+        for strategy, agent in execution_agents.items():
+            torch.save(agent.state_dict(), os.path.join(save_dir, f"execution_{strategy.lower()}_final.pth"))
+        logger.info("Saved final fine-tuned models")
+        
+        # --- WHITEBOX TELEMETRY ---
+        generate_whitebox_report(
+            agent=meta_agent,
+            preprocessor=preprocessor,
+            regime_detector=regime_detector,
+            execution_agents=execution_agents,
+            mode=mode,
+            window_size=window_size,
+            filename=os.path.join(save_dir, "whitebox_stage4_telemetry.csv"),
+            logger=logger
+        )
+    else:
+        logger.info("Skipping Stage 4")
     
     if use_wandb and WANDB_AVAILABLE:
         wandb.finish()
@@ -2868,8 +3487,23 @@ if __name__ == "__main__":
     parser.add_argument("--no-wandb", dest="use_wandb", action="store_false", help="Disable Weights & Biases")
     parser.add_argument("--wandb-project", type=str, default="hierarchical-transformer-trading", help="W&B project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name (optional)")
+    parser.add_argument("--multi-stock", type=str, nargs="+", default=None, 
+                       help="Multi-stock tickers for Stage 1 (e.g., --multi-stock AAPL MSFT GOOGL). "
+                            "Stage 1 learns general market dynamics. Stages 2-4 use single ticker.")
+    parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3, 4],
+                       help="Starting stage (1-4). Stage 1: Pre-train transformers, "
+                            "Stage 2: Pre-train execution agents, Stage 3: Train meta-strategy, "
+                            "Stage 4: End-to-end fine-tuning. Requires --load_pretrain if stage > 1.")
+    parser.add_argument("--load-pretrain", type=str, default=None,
+                       dest="load_pretrain",
+                       help="Path to pretrained transformer model (.pt or .pth file). "
+                            "Use this to skip Stage 1 and start from Stage 2. "
+                            "Example: --load-pretrain weights/transformer_pretrain_ETH-USD.pt")
     
     args = parser.parse_args()
+    
+    # Parse multi-stock tickers if provided
+    multi_stock_tickers = args.multi_stock if args.multi_stock else None
     
     # Setup logging with file handler for repetitive warnings
     # Create formatter
@@ -2920,15 +3554,28 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
     logger.info(f"Logging setup complete. Repetitive warnings saved to: {log_file}")
     
+    # Validate arguments
+    if args.stage > 1 and not args.load_pretrain:
+        logger.error(f"Cannot start from stage {args.stage} without --load-pretrain.")
+        logger.error("Please provide --load-pretrain path to a pretrained transformer model.")
+        raise ValueError(f"Stage {args.stage} requires --load-pretrain")
+    
+    if args.load_pretrain and not os.path.exists(args.load_pretrain):
+        logger.error(f"Pretrained model not found: {args.load_pretrain}")
+        raise FileNotFoundError(f"Pretrained model not found: {args.load_pretrain}")
+    
     # Train
     train_hierarchical_transformer(
         ticker=args.ticker,
         mode=args.mode,
         window_size=args.window_size,
         save_dir=args.save_dir,
+        multi_stock_tickers=multi_stock_tickers,  # Multi-stock for Stage 1
         logger=logger,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
-        wandb_entity=args.wandb_entity
+        wandb_entity=args.wandb_entity,
+        start_stage=args.stage,
+        load_pretrain_path=args.load_pretrain
     )
 

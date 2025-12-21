@@ -15,6 +15,11 @@ import pandas as pd
 import torch
 from typing import Dict, Optional, Tuple, List
 import logging
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Import from v0.1
 import sys
@@ -173,6 +178,11 @@ class ExecutionEnv(gym.Env):
                     elif current_return > 0.02:  # +2% gain, small bonus
                         shaped += self.conservative_bonus
         
+            # IDLE PENALTY: Discourage holding indefinitely without any position
+            # This encourages the agent to search for a trade rather than "folding" permanently
+            if action == 0 and shares == 0:  # HOLD while no position
+                shaped -= 0.05  # Aggressive penalty to break frozen state
+                
         return shaped
     
     def _get_observation(self):
@@ -459,19 +469,39 @@ class MetaStrategyEnv(gym.Env):
                         for interval, feat_array in windowed.items():
                             if len(feat_array) > 0:
                                 # Use last window
-                                feat_tensor = torch.FloatTensor(feat_array[-1]).unsqueeze(0)
+                                feat_tensor = torch.FloatTensor(feat_array[-1]).unsqueeze(0).to(device)
                                 features_dict[interval] = feat_tensor
                         
                         # Strategy features (one-hot)
-                        strategy_features = torch.zeros(1, 4)
+                        strategy_features = torch.zeros(1, 4).to(device)
                         strategy_idx = ["TREND_FOLLOW", "MEAN_REVERT", "MOMENTUM", "RISK_OFF"].index(selected_strategy)
                         strategy_features[0, strategy_idx] = 1.0
-                        
-                        # Get action from execution agent
+                                
+                        # Precision features (needed for the execution agent's transformer/MLP logic)
                         try:
-                            exec_action, _, _ = exec_agent.act(features_dict, strategy_features, deterministic=False)
-                        except:
-                            # Fallback to random if agent fails
+                            exec_shares = execution_env.base_env.shares
+                            exec_entry_price = execution_env.base_env.entry_price
+                            exec_curr_price = execution_env.base_env.data[execution_env.base_env.current_step, 0]
+                            
+                            # Get precision features using the agent's internal logic
+                            precision_features = exec_agent._get_precision_features(
+                                features_dict, exec_shares, exec_entry_price, exec_curr_price
+                            ).unsqueeze(0).to(device)
+                            
+                            # Get local features for ACTION MASKING
+                            local_feat_np = execution_env.base_env._get_local_features()
+                            local_feat = torch.from_numpy(local_feat_np).unsqueeze(0).float().to(device)
+                            
+                            # Execute agent with proper masking and features
+                            exec_action, _, _ = exec_agent.act(
+                                features_dict, 
+                                strategy_features, 
+                                precision_features=precision_features, 
+                                local_features=local_feat,
+                                deterministic=False
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Execution Agent act() failed: {e}. Falling back to random action.")
                             exec_action = execution_env.action_space.sample()
                     else:
                         exec_action = execution_env.action_space.sample()
@@ -541,10 +571,11 @@ class MetaStrategyEnv(gym.Env):
         next_obs = self._get_observation()
         
         # Calculate meta-reward (risk-adjusted return over horizon)
-        # FIX: Align reward with actual profitability, add strategy diversity bonus
+        # AMPLIFIED REWARD SCALING: Increased scaling to make profit signals louder
+        # This ensures the meta-agent prioritizes profit over randomness
         if self.initial_balance > 0:
             return_pct = (self.current_balance - self.initial_balance) / self.initial_balance
-            meta_reward = return_pct * 100  # Scale to percentage
+            meta_reward = return_pct * 1000  # Increased from 100 to 1000 to amplify profit signals
             
             # Add bonus for profitable strategies, penalty for losing ones
             if return_pct > 0:
@@ -571,9 +602,11 @@ class MetaStrategyEnv(gym.Env):
                 self._strategy_history = [selected_strategy]
             
             # Clip reward to prevent extreme values that cause NaN
-            meta_reward = np.clip(meta_reward, -100, 100)
+            # Increased clip range to match amplified reward scaling
+            meta_reward = np.clip(meta_reward, -1000, 1000)
         else:
-            meta_reward = np.clip(total_reward, -100, 100)
+            # Scale total_reward to match amplified scaling
+            meta_reward = np.clip(total_reward * 10.0, -1000, 1000)
         
         # Detect current regime for info
         regime = "TREND"  # Default
@@ -618,10 +651,18 @@ class MetaStrategyEnv(gym.Env):
                 'unrealized': True  # Mark as unrealized
             }
         
+        # Get current price for global awareness (always include in info)
+        if hasattr(execution_env.base_env, 'data') and execution_env.base_env.data is not None:
+            current_step = min(execution_env.base_env.current_step, len(execution_env.base_env.data) - 1)
+            current_price = execution_env.base_env.data[current_step, 0]
+        else:
+            current_price = 0.0
+
         info = {
             'strategy': selected_strategy,
             'regime': regime,
             'balance': self.current_balance,
+            'price': current_price,
             'return_pct': return_pct if self.initial_balance > 0 else 0.0,
             'execution_reward': total_reward,
             'hard_stop_loss': hard_stop_loss_triggered  # Pass hard stop-loss flag to training code

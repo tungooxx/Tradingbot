@@ -50,16 +50,18 @@ class CrossScaleAttention(nn.Module):
         # Scale factor for attention
         self.scale = self.head_dim ** -0.5
     
-    def forward(self, encoded_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, encoded_dict: Dict[str, torch.Tensor], return_weights: bool = False) -> torch.Tensor:
         """
         Apply cross-scale attention to encoded features.
         
         Args:
             encoded_dict: Dictionary of encoded features by timescale
                 Each tensor has shape (batch, d_model) or (batch, seq_len, d_model)
+            return_weights: If True, return (combined, attn_weights)
                 
         Returns:
             Combined features: (batch, d_model)
+            attn_weights (optional): (nhead, num_scales, batch, num_scales)
         """
         if not encoded_dict:
             # Return zeros if no features
@@ -108,20 +110,22 @@ class CrossScaleAttention(nn.Module):
         
         # Reshape for multi-head attention
         num_scales, batch_size, _ = Q.shape
-        Q = Q.view(num_scales, batch_size, self.nhead, self.head_dim).permute(2, 0, 1, 3)  # (nhead, num_scales, batch, head_dim)
-        K = K.view(num_scales, batch_size, self.nhead, self.head_dim).permute(2, 0, 1, 3)  # (nhead, num_scales, batch, head_dim)
-        V = V.view(num_scales, batch_size, self.nhead, self.head_dim).permute(2, 0, 1, 3)  # (nhead, num_scales, batch, head_dim)
+        # Target shape: (batch, nhead, num_scales, head_dim)
+        Q = Q.view(num_scales, batch_size, self.nhead, self.head_dim).permute(1, 2, 0, 3)
+        K = K.view(num_scales, batch_size, self.nhead, self.head_dim).permute(1, 2, 0, 3)
+        V = V.view(num_scales, batch_size, self.nhead, self.head_dim).permute(1, 2, 0, 3)
         
-        # Compute attention scores: (nhead, num_scales, batch, num_scales)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (nhead, num_scales, batch, num_scales)
+        # Compute attention scores: (batch, nhead, num_scales, num_scales)
+        # Multiply (num_scales, head_dim) by (head_dim, num_scales)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
-        # Apply attention to values: (nhead, num_scales, batch, head_dim)
-        attn_output = torch.matmul(attn_weights, V)  # (nhead, num_scales, batch, head_dim)
+        # Apply attention to values: (batch, nhead, num_scales, head_dim)
+        attn_output = torch.matmul(attn_weights, V)
         
-        # Concatenate heads: (num_scales, batch, d_model)
-        attn_output = attn_output.permute(1, 2, 0, 3).contiguous().view(num_scales, batch_size, self.d_model)
+        # Reshape back to (num_scales, batch, d_model)
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(num_scales, batch_size, self.d_model)
         
         # Output projection
         output = self.W_o(attn_output)  # (num_scales, batch, d_model)
@@ -130,6 +134,8 @@ class CrossScaleAttention(nn.Module):
         # Aggregate across scales (mean pooling)
         combined = output.mean(dim=0)  # (batch, d_model)
         
+        if return_weights:
+            return combined, attn_weights
         return combined
 
 
